@@ -8102,6 +8102,54 @@ def _collect_dead_markers(certdir: Path, keep_pid: int | None = None) -> None:
             continue
 
 
+def _hold_stop_signals_until_ready() -> list:
+    """Catch SIGTERM/SIGINT and only RECORD them, until the real teardown
+    handler is installed. Returns the list the signals are recorded into;
+    hand it to `_deliver_held_stop_signal` once `_install_signal_teardown`
+    has run.
+
+    WHY THIS EXISTS: `daemon_main` starts accepting on the held socket
+    (`proxy.start()`) and publishes `proxy.json` well before it can drain:
+    `_teardown` needs the wiring check, the fifo and `done`, so its handler
+    went in last. A TERM in that gap met the DEFAULT action, the process died
+    by the signal (the holder logs `exited (code -15)`, a code the teardown
+    handler never produces) and every request it had already accepted was
+    reset. A deploy that TERMs a daemon the moment its record appears (the
+    record is written right after `start()`) lands in exactly that gap;
+    `TestDaemonPortStability::case_a_planned_restart_under_a_holder_loses_nothing`
+    does it twice per run and failed 19 of 20 runs alone.
+
+    Recording rather than acting is the point: a teardown run from inside
+    `start()` would drain a half-started server. The signal waits, and is
+    delivered once the daemon can honour it."""
+    held: list = []
+
+    def _record(signum, frame):
+        held.append(signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _record)
+        except (ValueError, OSError):
+            pass  # not on the main thread (tests): nothing to hold
+    return held
+
+
+def _deliver_held_stop_signal(held: list) -> None:
+    """Re-raise the first stop signal `_hold_stop_signals_until_ready`
+    recorded, now that the teardown handler is installed, so it drains and
+    exits the same way a TERM arriving later would. One is enough: the
+    teardown handler ignores a second one anyway (T1410)."""
+    if not held:
+        return
+    name = signal.Signals(held[0]).name
+    _log_lifecycle(
+        f"signal {name} arrived during start -- held until the drain could "
+        f"run, delivering it now"
+    )
+    signal.raise_signal(held[0])
+
+
 def _install_signal_teardown(cleanup) -> None:
     """Register SIGTERM/SIGINT so a recycle/cc-update TERM runs ``cleanup``
     (stop the server, remove the state file) instead of a bare default kill —
@@ -13609,6 +13657,9 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
         pin_token_provider=make_pin_token_provider(switcher, account_num, email),
         rediscover_chain=True,
     )
+    # BEFORE `start()`: from the first accept on, a TERM must drain, never
+    # kill. See `_hold_stop_signals_until_ready`.
+    held_stop_signals = _hold_stop_signals_until_ready()
     proxy.start()
     # `_OWN_FINGERPRINT`, NOT a fresh read. This record is an IDENTITY — it is
     # what `runtime_health`, a deploy check or a human answers "is the running
@@ -13768,6 +13819,7 @@ def daemon_main(account_num: str, email: str, certdir: Path) -> None:
 
     # A recycle/cc-update TERM runs the same cleanup as an idle teardown.
     _install_signal_teardown(_teardown)
+    _deliver_held_stop_signal(held_stop_signals)
 
     threading.Thread(
         target=_watch_own_code,

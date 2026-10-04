@@ -10988,6 +10988,79 @@ class TestDaemonSignalTeardown:
         # daemon_main is heavy (starts a server); instead unit-test the helper.
         assert hasattr(pin_proxy, "_install_signal_teardown")
 
+    def case_daemon_main_holds_a_stop_signal_from_before_start(self):
+        """`daemon_main` must catch a TERM from BEFORE `proxy.start()` until
+        `_install_signal_teardown` has run, then deliver it. The teardown
+        handler went in long after `start()` and after `proxy.json` was
+        published, so a TERM sent the moment the record appeared hit the
+        default action: the daemon died by the signal (`exited (code -15)`)
+        and reset every request it had accepted. Read off the source, in the
+        style of the `_teardown` checks below, because only the ORDER of
+        three calls is the fact under test."""
+        import ast
+        import inspect
+        import textwrap
+
+        from cswap_pin import proxy as pin_proxy
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(pin_proxy.daemon_main)))
+        body = tree.body[0].body
+
+        def _first_line(pred):
+            for stmt in body:
+                for n in ast.walk(stmt):
+                    if isinstance(n, ast.Call) and pred(n.func):
+                        return stmt.lineno
+            return None
+
+        hold = _first_line(
+            lambda f: getattr(f, "id", None) == "_hold_stop_signals_until_ready")
+        start = _first_line(
+            lambda f: isinstance(f, ast.Attribute) and f.attr == "start"
+            and getattr(f.value, "id", None) == "proxy")
+        install = _first_line(
+            lambda f: getattr(f, "id", None) == "_install_signal_teardown")
+        deliver = _first_line(
+            lambda f: getattr(f, "id", None) == "_deliver_held_stop_signal")
+        assert hold is not None and start is not None, (
+            "daemon_main must hold stop signals and start the proxy")
+        assert hold < start, (
+            "stop signals must be held BEFORE proxy.start(): from the first "
+            "accept on, a TERM has to drain rather than kill")
+        assert install is not None and deliver is not None and install < deliver, (
+            "a held stop signal must be delivered AFTER the teardown handler "
+            "is installed, or it is lost or kills by default")
+
+    def case_a_held_stop_signal_waits_for_the_teardown_handler(self):
+        """A SIGTERM between `_hold_stop_signals_until_ready` and
+        `_install_signal_teardown` must neither kill the process nor be
+        lost: it is recorded, and `_deliver_held_stop_signal` hands it to
+        whatever handler is installed by then, exactly once."""
+        import os
+        import signal as _signal
+
+        from cswap_pin import proxy
+
+        saved = {s: _signal.getsignal(s) for s in (_signal.SIGTERM, _signal.SIGINT)}
+        try:
+            held = proxy._hold_stop_signals_until_ready()
+            os.kill(os.getpid(), _signal.SIGTERM)
+            os.kill(os.getpid(), _signal.SIGTERM)
+            # A signal raised at our own pid runs its Python handler on this
+            # (main) thread at the next bytecode boundary; nothing to wait on.
+            assert held == [_signal.SIGTERM, _signal.SIGTERM]
+
+            seen = []
+            _signal.signal(_signal.SIGTERM, lambda s, f: seen.append(s))
+            proxy._deliver_held_stop_signal(held)
+            assert seen == [_signal.SIGTERM]
+
+            proxy._deliver_held_stop_signal([])
+            assert seen == [_signal.SIGTERM], "nothing held, nothing delivered"
+        finally:
+            for s, h in saved.items():
+                _signal.signal(s, h)
+
     def case_a_second_signal_while_draining_does_not_re_enter(self):
         """A second SIGTERM while the first `cleanup` is still draining must
         not start a second drain or exit twice (T1410). Without a first-entry
