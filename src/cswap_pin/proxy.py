@@ -21734,6 +21734,131 @@ def _spawn_usage_header_recorder(fn) -> None:
     threading.Thread(target=fn, daemon=True).start()
 
 
+# A REFUSED SETUP-TOKEN. A `claude setup-token` account has no refresh path
+# and its scope never reaches the usage endpoint, so the only place its
+# token's early death (revoked on claude.ai, or the plan lapsed) shows is a
+# `/v1/messages` reply refusing it. cswap strikes such a slot out of rotation
+# (`record_credential_refused`, `claude_swap.switcher`) when the refused
+# bearer is the LIVE slot's stored token. Only `/v1/messages`: it is the
+# route a setup-token's inference scope is for, so a refusal there is about
+# the token; other routes (the usage endpoint answers every setup-token 403)
+# refuse it by scope and say nothing about whether it is alive.
+_REFUSAL_ERROR_TYPES = frozenset({"authentication_error", "permission_error"})
+# bearer token -> monotonic time of the last refusal thread spawned for it:
+# a burst of refused replies on one token (every session retrying) resolves
+# the live slot once per window, not once per reply. cswap's own strike is
+# idempotent, so a refusal inside the window loses nothing.
+_refusal_spawn_seen: dict[str, float] = {}
+_REFUSAL_THROTTLE_S = 30.0
+_refusal_recorder_missing_warned = False
+
+
+def _bearer_token(auth: str) -> str:
+    """The token of an ``Authorization: Bearer`` value, or "" for none."""
+    token = auth.strip()
+    return token[7:].strip() if token[:7].lower() == "bearer " else ""
+
+
+def _refusal_status(status_line: bytes, path: "str | None",
+                    auth: str) -> "int | None":
+    """401 or 403 when this upstream reply may refuse the request's own
+    bearer on `/v1/messages`; None otherwise."""
+    if (path or "").split("?", 1)[0].rstrip("/") != "/v1/messages":
+        return None
+    if not _bearer_token(auth):
+        return None
+    for code in (401, 403):
+        if status_line.startswith(b"HTTP/1.1 %d" % code):
+            return code
+    return None
+
+
+def _finish_credential_refusal(capture: "_UsageCapture | None",
+                               auth: str) -> None:
+    """Report a captured 403 whose body's error type is authentication or
+    permission; a 403 of any other type, or a body that is incomplete or
+    encoded, refuses nothing about the credential."""
+    if capture is None:
+        return
+    body = capture.json_body()
+    error = body.get("error") if body is not None else None
+    if not isinstance(error, dict) or error.get("type") not in (
+            _REFUSAL_ERROR_TYPES):
+        return
+    try:
+        _note_credential_refused(403, auth)
+    except Exception:  # noqa: BLE001 -- never let a statistic break a reply
+        pass
+
+
+def _note_credential_refused(status: int, auth: str) -> None:
+    """Tell cswap the API refused the request's bearer, when that bearer IS
+    the live slot's stored setup-token.
+
+    A bearer that is not the live token is a session still holding an
+    account cswap has switched away from: its 401 is the existing rebuild
+    path's (the client rebuilds onto the live account), and nothing here
+    strikes the account it names. A live browser login is not reported
+    either: its refresh machinery owns its verdict. Off the relay's thread,
+    for the same reason as `_note_usage_headers`: resolving the live slot
+    can ask the server.
+    """
+    token = _bearer_token(auth)
+    if not token:
+        return
+    now = time.monotonic()
+    with _usage_header_lock:
+        last = _refusal_spawn_seen.get(token)
+        if last is not None and now - last < _REFUSAL_THROTTLE_S:
+            return
+        _refusal_spawn_seen.pop(token, None)
+        _refusal_spawn_seen[token] = now
+        if len(_refusal_spawn_seen) > 8:
+            del _refusal_spawn_seen[next(iter(_refusal_spawn_seen))]
+
+    def _run() -> None:
+        try:
+            sw = require("switcher").ClaudeAccountSwitcher()
+            slot = sw.current_account_number()
+            raw = sw._read_credentials() or ""
+            oauth = require("oauth")
+            live = oauth.extract_access_token(raw) if raw else None
+            if slot is None or not live or token != live:
+                return
+            if not oauth.is_setup_token_credential(raw):
+                return
+            if not hasattr(sw, "record_credential_refused"):
+                _warn_no_refusal_recorder_once()
+                return
+            sw.record_credential_refused(
+                str(slot), status, oauth.credential_fingerprint(raw))
+        except Exception as exc:  # noqa: BLE001 -- never let this break the relay
+            _log_lifecycle(
+                f"warning: credential-refusal record raised "
+                f"{exc.__class__.__name__}, so a refused setup-token "
+                f"(http-{status}) was not struck out of rotation"
+            )
+
+    _spawn_usage_header_recorder(_run)
+
+
+def _warn_no_refusal_recorder_once() -> None:
+    """Say ONCE per daemon that the installed claude-swap cannot take a
+    refused setup-token (it predates ``record_credential_refused``), so a
+    token that died early stays in rotation."""
+    global _refusal_recorder_missing_warned
+    with _usage_header_lock:
+        if _refusal_recorder_missing_warned:
+            return
+        _refusal_recorder_missing_warned = True
+    _log_lifecycle(
+        "warning: the installed claude-swap has no "
+        "ClaudeAccountSwitcher.record_credential_refused (it predates that "
+        "method), so a setup-token the API refuses is NOT struck out of "
+        "rotation; upgrade claude-swap to a build that has it"
+    )
+
+
 # CLAUDE CODE'S OWN USAGE READS. Claude Code sends `GET /api/oauth/usage`
 # itself (2.1.287: the plain URL, `?at_wall=1&skip_spend=1` and
 # `?cedar_ember=1&skip_spend=1`), on the account cswap has live, and the
@@ -21951,6 +22076,19 @@ def _relay_response(
     _note_worker_status(path, status_line, certdir)
     if note_hop:
         _note_hop_trouble(status_line)
+    # A REFUSED CREDENTIAL ON /v1/messages: a 401 says so in its status, so
+    # it is reported now; a 403 is a refusal only when its body's error type
+    # says authentication or permission, so its body is captured below and
+    # reported once it has reached the client (`_finish_credential_refusal`).
+    _refused = _refusal_status(_upstream_status_line, path, auth)
+    if _refused == 401:
+        try:
+            _note_credential_refused(401, auth)
+        except Exception:  # noqa: BLE001 -- never let a statistic break a reply
+            pass
+    _refusal_capture = _UsageCapture() if _refused == 403 else None
+    if _refusal_capture is not None:
+        capture = _refusal_capture
     # Unconditional: `/v1/messages` is never pinned so the `swapped` take-back
     # above cannot see it; 401 is a rebuild trigger, 429 is not.
     _walled_401 = False
@@ -22197,6 +22335,7 @@ def _relay_response(
             sink=capture.body if capture is not None else None)
         if capture is not None:
             capture.complete = relayed
+        _finish_credential_refusal(_refusal_capture, auth)
         return relayed and keep
     if capture is not None:
         capture.body += rest
@@ -22215,6 +22354,7 @@ def _relay_response(
             remaining -= len(chunk)
         if capture is not None:
             capture.complete = True
+        _finish_credential_refusal(_refusal_capture, auth)
         return keep
     # No framing: body runs to EOF (SSE and close-delimited replies).
     while True:
@@ -22229,6 +22369,7 @@ def _relay_response(
             capture.body += chunk
     if capture is not None:
         capture.complete = True
+    _finish_credential_refusal(_refusal_capture, auth)
     return False
 
 
