@@ -789,7 +789,13 @@ try:  # pragma: no cover - one branch per environment, both are real
 except PackageNotFoundError:
     _PIN_VER = re.escape("0+unknown")
 
-PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r" pid=\d+ "
+# THE HOST SUFFIX IS OPTIONAL HERE, BY DESIGN OF THE PRODUCER. `_component_tag`
+# appends `_host_head()`, which is `+<checkout dir>@<8 hex>` when claude-swap is
+# installed from a git checkout (editable) and "" for a wheel or a git-URL
+# install. Its exact value is asserted by the `_host_head` cases in
+# test_proxy.py; this pattern only has to accept both real shapes, or the suite
+# reads red on every editable host install.
+PIN_STAMP = r"\] cswap-pin/" + _PIN_VER + r"(?:\+[^@\s]+@[0-9a-f]{1,8})? pid=\d+ "
 
 # --- one pytest test per class, N cases inside -------------------------------
 # The suite's cases are cheap (54 ms each, measured) and its per-case pytest

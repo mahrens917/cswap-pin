@@ -10748,12 +10748,12 @@ class TestAutoViewPinBadge:
         stub._pinned_email = lambda: AutoScreen._pinned_email(stub)
         return AutoScreen._candidates_text(stub, snap, active).plain
 
-    def _acct(self, num, email, pct=None):
+    def _acct(self, num, email, org_uuid=""):
         from claude_swap.models import AccountSnapshot
         from claude_swap.usage_store import UsageEntry
 
         return AccountSnapshot(
-            number=str(num), email=email, org_name="", org_uuid="",
+            number=str(num), email=email, org_name="", org_uuid=org_uuid,
             is_active=False, kind="oauth", switchable=True,
             usage=UsageEntry(last_good=None, fetched_at=None, age_s=None),
         )
@@ -10764,7 +10764,10 @@ class TestAutoViewPinBadge:
         save_pin(tmp_path, "pinned@example.com", "org-1")
         out = self._rows(
             tmp_path,
-            [self._acct(1, "pinned@example.com"), self._acct(2, "other@example.com")],
+            [
+                self._acct(1, "pinned@example.com", "org-1"),
+                self._acct(2, "other@example.com", "org-1"),
+            ],
         )
         pinned_line = next(l for l in out.splitlines() if "pinned@example.com" in l)
         other_line = next(l for l in out.splitlines() if "other@example.com" in l)
@@ -10777,8 +10780,29 @@ class TestAutoViewPinBadge:
         from cswap_pin.proxy import save_pin
 
         save_pin(tmp_path, "pinned@example.com", "org-1")
-        out = self._rows(tmp_path, [self._acct(1, "pinned@example.com")])
+        out = self._rows(tmp_path, [self._acct(1, "pinned@example.com", "org-1")])
         assert "usage unknown" in out and "○ cloud" in out
+
+    def case_badge_needs_the_org_as_well_as_the_email(self, tmp_path):
+        """The cloud account is the pair (email, organization), not the email.
+
+        Two managed slots can share one address across organizations, and an
+        email-only match lit BOTH rows. claude-swap's `account_is_pinned`
+        compares the pair, so the same address under another org stays bare.
+        """
+        from cswap_pin.proxy import save_pin
+
+        save_pin(tmp_path, "pinned@example.com", "org-1")
+        out = self._rows(
+            tmp_path,
+            [
+                self._acct(1, "pinned@example.com", "org-1"),
+                self._acct(2, "pinned@example.com", "org-2"),
+            ],
+        )
+        rows = [l for l in out.splitlines() if "pinned@example.com" in l]
+        assert len(rows) == 2, out
+        assert sum("○ cloud" in l for l in rows) == 1, out
 
     def case_no_badge_without_a_pin(self, tmp_path):
         out = self._rows(tmp_path, [self._acct(1, "a@co.com"), self._acct(2, "b@co.com")])
@@ -10814,11 +10838,12 @@ class TestAutoViewPinBadge:
         app = _App()
         app.switcher.backup_dir = tmp_path
 
-        class _Settings:
-            threshold = 90.0
-            interval_seconds = 360.0
-            model = ""
+        from claude_swap.settings import AutoSwitchSettings
 
+        # The REAL settings record, not a stand-in class: a stand-in listing
+        # only the fields this test knew about broke the day `_update_summary`
+        # started reading `strategy`, which the real record always carries.
+        settings = AutoSwitchSettings(threshold=90.0, interval_seconds=360.0)
         written = {}
 
         class _Widget:
@@ -10830,8 +10855,9 @@ class TestAutoViewPinBadge:
 
         stub = _Stub()
         stub.app = app
-        stub._settings = _Settings()
-        stub._configured_threshold = _Settings.threshold
+        stub._settings = settings
+        stub._configured_threshold = settings.threshold
+        stub._configured_strategy = settings.strategy
         stub._adjusting = False
         stub.query_one = lambda *a, **k: _Widget()
         stub._pinned_email = lambda: AutoScreen._pinned_email(stub)
@@ -14217,11 +14243,14 @@ print("OK", port)
         if sys.platform != "linux":
             return
 
+        # glibc's own `tgkill` wrapper (glibc 2.30+), never a raw syscall
+        # number. This used `syscall(234, ...)` on the claim that x86_64 and
+        # aarch64 agree on 234; they do not. 234 is tgkill on x86_64 only; on
+        # aarch64 (the asm-generic table) tgkill is 131 and 234 is
+        # `remap_file_pages`, which answered EINVAL, so the case failed on
+        # every arm64 host before it measured anything. The wrapper carries
+        # the right number for whatever arch it was built for.
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        # x86_64 and aarch64 agree on 234 for tgkill; return rather than
-        # guess -- same reasoning as the platform check above.
-        if os.uname().machine not in ("x86_64", "aarch64"):
-            return
 
         ensure_ca(tmp_path, "api.anthropic.com")
         holder = PortHolder(tmp_path, "1", "a@b.c")
@@ -14245,7 +14274,7 @@ print("OK", port)
             non_main = [t for t in tids if t != pid]
             assert non_main, "the daemon had no worker threads to deliver to"
 
-            if libc.syscall(234, pid, non_main[0], int(signal.SIGTERM)) != 0:
+            if libc.tgkill(pid, non_main[0], int(signal.SIGTERM)) != 0:
                 raise AssertionError(
                     f"tgkill failed: {os.strerror(ctypes.get_errno())}"
                 )
