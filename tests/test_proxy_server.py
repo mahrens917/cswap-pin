@@ -16849,7 +16849,7 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
               validated=True, before=None, live_token=None, usage=None,
               snap=None, live_num="1", entry_walled=False,
               record_usage_headers=None, fleet=None, disabled=None,
-              reason="candidates-exhausted"):
+              reason="candidates-exhausted", token_slots=None):
         """Stub claude_swap's switcher so no real account store is touched.
 
         ``validated=None`` omits the key entirely (an older cswap that never
@@ -16892,7 +16892,14 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         reads that key rather than parsing an ISO string). ``disabled``
         names which of ``fleet``'s accounts ``is_account_disabled`` answers
         True for. ``reason`` overrides the default ``switched=False``
-        reason string."""
+        reason string.
+
+        ``token_slots`` is what ``slot_for_access_token`` answers: a
+        ``{token: slot}`` map of every token the fake store holds, as the
+        real host matches the live login's token and each slot's saved
+        credential. Omitted, the fake store holds only the live login, so
+        the live token names ``live_num`` and every other token names no
+        slot."""
         from cswap_pin import proxy as pp
 
         calls = []
@@ -16948,12 +16955,21 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
                     walled=False)
             return entries
 
+        def _current_account_number():
+            return live_num() if callable(live_num) else live_num
+
+        def _slot_for_access_token(token):
+            if token_slots is not None:
+                return token_slots.get(token)
+            lt = live_token() if callable(live_token) else live_token
+            return _current_account_number() if token == lt else None
+
         _attrs = dict(
             switch=_switch,
             _read_credentials=_read_credentials,
-            current_account_number=(
-                live_num if callable(live_num) else lambda: live_num),
+            current_account_number=_current_account_number,
             usage_entries_by_account=_usage_entries_by_account,
+            slot_for_access_token=_slot_for_access_token,
         )
         if record_usage_headers is not None:
             _attrs["record_usage_headers"] = record_usage_headers
@@ -16995,6 +17011,8 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         # `record_usage_headers` is the same kind of process memo: left set,
         # it would hide the warning from whichever case asserts it next.
         monkeypatch.setattr(pp, "_usage_recorder_missing_warned", False)
+        # The per-token warning for a bearer no slot owns, same reason.
+        pp._usage_token_unowned_warned.clear()
         return calls
 
     @classmethod
@@ -17667,11 +17685,12 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         from cswap_pin import proxy as pp
         self._run_usage_thread_synchronously(monkeypatch)
         recorded = []
-        # A real client always presents whatever is currently live, so the
-        # rotation moves BOTH the store's own answer and the request's own
-        # bearer together — only the slot ("1", `_wire`'s default) stays put.
-        tokens = iter([self.LIVE, self.LIVE + "-rotated"])
-        self._wire(monkeypatch, switched=True, live_token=lambda: next(tokens),
+        # Both tokens are slot "1"'s: the store holds the rotated one as the
+        # live login and the earlier one as the saved credential's retained
+        # generation, so `slot_for_access_token` names "1" for each.
+        self._wire(monkeypatch, switched=True,
+                   live_token=self.LIVE + "-rotated",
+                   token_slots={self.LIVE: "1", self.LIVE + "-rotated": "1"},
                    record_usage_headers=lambda *a: recorded.append(a))
         pp._usage_header_seen.clear()
         self._relay(status=b"200 OK", reset=False, auth="Bearer " + self.LIVE,
@@ -17683,18 +17702,83 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             f"two tokens of the same slot inside the TTL must be one "
             f"record, not one per token: {recorded}")
 
-    def case_a_stale_token_never_calls_record(self, monkeypatch):
-        """The request's own token must equal the LIVE one, or a stale
-        session's headers would land on the healthy slot it is not
-        talking to."""
+    def case_two_slots_inside_30s_each_record_once(self, monkeypatch):
+        """Asserts: the throttle is per SLOT, not one window for the whole
+        daemon. A reply on slot "1" and a reply on slot "2" inside the same
+        window each record onto their own slot, and a second reply on slot
+        "2" inside that window records nothing."""
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        self._wire(monkeypatch, switched=True, live_token=self.LIVE,
+                   token_slots={self.LIVE: "1", "slot-two-token": "2",
+                                "slot-two-rotated": "2"},
+                   record_usage_headers=lambda num, h: recorded.append(num))
+        for token in (self.LIVE, "slot-two-token", "slot-two-rotated"):
+            self._relay(status=b"200 OK", reset=False,
+                        auth="Bearer " + token,
+                        extra_headers=self._5H_HEADER)
+        assert recorded == ["1", "2"], recorded
+
+    def case_a_token_no_slot_owns_records_nothing_and_warns_once(
+        self, monkeypatch,
+    ):
+        """Asserts: a bearer no stored credential carries (a session still
+        holding a token cswap has since replaced) records nothing, because
+        there is no slot its reading belongs to, and says so in daemon.log
+        ONCE per token: two replies on that token (the spawn gate aged
+        between them so both reach the worker) log one warning, and a
+        second unowned token gets its own."""
+        from cswap_pin import proxy as pp
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
         self._run_usage_thread_synchronously(monkeypatch)
         recorded = []
         self._wire(monkeypatch, switched=True, live_token=self.LIVE,
                    record_usage_headers=lambda *a: recorded.append(a))
-        self._relay(status=b"200 OK", reset=False,
-                    auth="Bearer stale-account-token",
-                    extra_headers=self._5H_HEADER)
+        for token in ("stale-account-token", "stale-account-token",
+                      "another-stale-token"):
+            pp._usage_header_spawn_seen.clear()
+            self._relay(status=b"200 OK", reset=False,
+                        auth="Bearer " + token,
+                        extra_headers=self._5H_HEADER)
         assert not recorded, recorded
+        warned = [m for m in logged if "no stored credential carries" in m]
+        assert len(warned) == 2, logged
+        assert all(m.startswith("warning:") for m in warned), warned
+        assert not any("stale-account-token" in m for m in warned), (
+            f"the warning must name a digest, never the token: {warned}")
+
+    def case_a_429_whose_wall_switch_moves_the_live_account_records_its_own_slot(
+        self, monkeypatch,
+    ):
+        """Asserts (X3650): a 429's usage headers land on the slot that owns
+        the request's own token, even though `_switch_off_walled_account`
+        has already moved the live account off that slot by the time the
+        recorder runs. Measured 2026-10-08T13:47:42Z: a setup-token
+        account's first reply after a switch was a 429, the recorder found
+        the live token changed and dropped the reading, and that account
+        (measured from reply headers alone) then read as unavailable."""
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        moved = {"v": False}
+
+        def _move():
+            moved["v"] = True
+
+        self._wire(monkeypatch, switched=True, before=_move,
+                   usage=self.HEADROOM,
+                   live_token=lambda: "slot-two-token" if moved["v"] else self.LIVE,
+                   live_num=lambda: "2" if moved["v"] else "1",
+                   token_slots={self.LIVE: "1", "slot-two-token": "2"},
+                   record_usage_headers=lambda num, headers:
+                       recorded.append((num, headers)))
+        got = self._relay(auth="Bearer " + self.LIVE,
+                          extra_headers=self._5H_HEADER)
+        assert moved["v"], "the wall switch never ran"
+        assert got.startswith(b"HTTP/1.1 401"), got[:40]
+        assert [num for num, _ in recorded] == ["1"], recorded
+        assert recorded[0][1][
+            "anthropic-ratelimit-unified-5h-utilization"] == "0.42", recorded
 
     def case_a_switcher_without_the_method_raises_nothing(self, monkeypatch):
         """`_wire`'s default fake switcher has no `record_usage_headers` —

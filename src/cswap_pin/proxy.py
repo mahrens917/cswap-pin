@@ -20,6 +20,7 @@ import base64
 import contextlib
 import datetime as _dt
 import glob
+import hashlib
 import inspect
 import itertools
 import json
@@ -21577,15 +21578,17 @@ def _switch_off_walled_account(
 
 _USAGE_HEADER_THROTTLE_S = 30.0
 _usage_header_lock = threading.Lock()
-# live SLOT -> monotonic time of the last thread that recorded for it. Keyed
+# SLOT (the one owning the request's token) -> monotonic time of the last
+# thread that recorded for it. Keyed
 # on the slot, not the bearer: cswap's own `record_usage_headers` throttles
 # per SLOT at most once per 30s, and a token ROTATION on the same account is
 # still the same slot, so keying on the token let two different tokens of
 # one slot each pay their own record inside the window `record_usage_headers`
-# means to collapse to one — and let a burst of OTHER accounts' bearers
+# means to collapse to one -- and let a burst of OTHER accounts' bearers
 # evict the live slot's own entry first, since eviction below takes
-# whichever key was inserted longest ago. Resolving the slot needs
-# `current_account_number()`, which can ask the server — see
+# whichever key was inserted longest ago. Resolving the slot goes through
+# `slot_for_access_token`, which reads every slot's saved credential and
+# `current_account_number()`, which can ask the server -- see
 # `_note_usage_headers` for why that read, and so this whole memo, lives in
 # the spawned thread rather than on the relay's own. LRU: a RECORDED reply
 # moves the key to the newest end (pop, then reinsert) — a throttled hit
@@ -21593,7 +21596,7 @@ _usage_header_lock = threading.Lock()
 # RECORDED slot, not merely the least recently touched one.
 _usage_header_seen: dict[str, float] = {}
 # bearer token -> monotonic time of the last thread SPAWNED for it. Cheap
-# (the caller already has `token`, for the same match `_run` makes anyway):
+# (the caller already has `token`, the same one `_run` looks its slot up by):
 # a pre-spawn gate so a hot /v1/messages loop on ONE token pays for at most
 # one `ClaudeAccountSwitcher()` resolution per `_USAGE_HEADER_THROTTLE_S`,
 # not one thread PER REPLY. A token ROTATION still spawns its own thread
@@ -21610,12 +21613,20 @@ def _note_usage_headers(
     only fresh reading available while an account is walled. See
     ``record_usage_headers`` (``claude_swap.switcher``).
 
-    NEVER ON THE RELAY'S OWN THREAD past this function. Resolving the live
-    slot goes through `current_account_number()`, whose docstring already
-    warns it can ask the server — fine once per 429 under
+    The reading is charged to the slot that OWNS THE REQUEST'S TOKEN
+    (`slot_for_access_token`), not to the slot live when the worker runs:
+    on a 429 the wall switch has already moved the live login by then, and
+    the headers still describe the account the request went out on. A
+    token no stored credential carries records nothing
+    (`_warn_unowned_usage_token_once`).
+
+    NEVER ON THE RELAY'S OWN THREAD past this function. Resolving the
+    token's slot reads every slot's saved credential and goes through
+    `current_account_number()`, whose docstring already warns it can ask
+    the server -- fine once per 429 under
     `_switch_off_walled_account`'s lock, not on every 200 this fires for.
-    So the slot read, the per-slot throttle check against
-    `_usage_header_seen`, the token match, and the write all happen in a
+    So the slot lookup, the per-slot throttle check against
+    `_usage_header_seen`, and the write all happen in a
     throwaway thread; this function itself only decides whether to START
     one, behind the cheap pre-spawn gate against `_usage_header_spawn_seen`
     — a header scan, a bearer strip, and one dict lookup, all already
@@ -21656,13 +21667,21 @@ def _note_usage_headers(
 
     def _run() -> None:
         try:
-            slot = _live_account_slot()
-            live = _active_oauth_token()
-            # ONLY WHEN THE REQUEST'S OWN TOKEN IS STILL THE LIVE ONE —
-            # otherwise a stale session's headers, read off an account it
-            # is no longer even talking to, would land on the slot cswap
-            # actually has live now.
-            if slot is None or live is None or token != live:
+            sw = require("switcher").ClaudeAccountSwitcher()
+            # THE SLOT THAT OWNS THE REQUEST'S OWN TOKEN, never whichever
+            # slot is live when this thread runs. The headers describe the
+            # account the request was sent on, and the token names that
+            # account by construction. Reading the live slot instead dropped
+            # every 429 (X3650): `_relay_response` walls the account and
+            # `switch()` moves the live login off it BEFORE this function is
+            # called, so by now the live token is another account's and a
+            # live-token match fails. Measured 2026-10-08T13:47:42Z: a
+            # setup-token account, measured from these headers alone, got a
+            # 429 as its first reply after a switch, its reading was never
+            # stored, and `cswap list` showed it unavailable.
+            slot = sw.slot_for_access_token(token)
+            if slot is None:
+                _warn_unowned_usage_token_once(token)
                 return
             # THE SAME `now` THE SPAWN GATE ABOVE STAMPED — not a fresh
             # `time.monotonic()` read here, which dated the slot memo from
@@ -21679,7 +21698,6 @@ def _note_usage_headers(
                 _usage_header_seen[slot] = now
                 if len(_usage_header_seen) > 8:
                     del _usage_header_seen[next(iter(_usage_header_seen))]
-            sw = require("switcher").ClaudeAccountSwitcher()
             if not hasattr(sw, "record_usage_headers"):
                 _warn_no_usage_recorder_once()
                 return
@@ -21724,6 +21742,46 @@ def _warn_no_usage_recorder_once() -> None:
         "method), so usage from /v1/messages reply headers is NOT recorded "
         "and the usage figure rests on the usage endpoint alone; upgrade "
         "claude-swap to a build that has it"
+    )
+
+
+# Digest of each bearer `_warn_unowned_usage_token_once` has already named,
+# under `_usage_header_lock`; insertion order is the eviction order. Bounded
+# so a daemon that lives for weeks does not keep one entry per token it ever
+# relayed: past the bound the oldest digest goes, and that token, if it is
+# still being sent, is named once more.
+_usage_token_unowned_warned: dict[str, None] = {}
+_USAGE_TOKEN_UNOWNED_WARNED_MAX = 64
+
+
+def _warn_unowned_usage_token_once(token: str) -> None:
+    """Say ONCE per bearer that a `/v1/messages` reply's usage headers were
+    not recorded because no slot cswap stores carries the request's token.
+
+    The producer is a Claude Code session that read its credential before
+    cswap replaced it (a slot's saved credential refreshed twice since, or
+    a setup-token re-added with `cswap add-token`): `slot_for_access_token`
+    matches the live login and each slot's current and retained previous
+    generation, and an access token carries no account identity to match
+    on beyond that. The reading belongs to an account, but which one cannot
+    be known, so it is dropped rather than charged to a guess. Seen on a
+    healthy daemon only while such a session lives; a session that keeps
+    sending an unowned token is one that never picked up a switch.
+
+    Names a digest of the token, never the token itself.
+    """
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+    with _usage_header_lock:
+        if digest in _usage_token_unowned_warned:
+            return
+        _usage_token_unowned_warned[digest] = None
+        if len(_usage_token_unowned_warned) > _USAGE_TOKEN_UNOWNED_WARNED_MAX:
+            del _usage_token_unowned_warned[next(iter(_usage_token_unowned_warned))]
+    _log_lifecycle(
+        "warning: a /v1/messages reply carried usage headers on a bearer no "
+        f"stored credential carries (sha256 {digest}), so its reading is NOT "
+        "recorded; the session sending it still holds a token cswap has "
+        "replaced"
     )
 
 
