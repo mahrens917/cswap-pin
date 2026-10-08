@@ -10834,6 +10834,9 @@ class TestAutoViewPinBadge:
                 pass
 
             current_theme = _T()
+            # The real app's `snapshot` is a reactive that starts as None
+            # (claude-swap tui/app.py); the summary line reads it.
+            snapshot = None
 
         app = _App()
         app.switcher.backup_dir = tmp_path
