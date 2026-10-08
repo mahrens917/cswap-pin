@@ -17813,6 +17813,22 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
         assert recorded[0][1][
             "anthropic-ratelimit-unified-5h-utilization"] == "0.42", recorded
 
+    def case_a_reply_with_only_the_credit_status_is_recorded(self, monkeypatch):
+        """Asserts (X3655): a 429 that carries the usage-credit (overage)
+        status but no 5h window still reaches the recorder, so a
+        setup-token account's credit state is read from it."""
+        self._run_usage_thread_synchronously(monkeypatch)
+        recorded = []
+        self._wire(monkeypatch, switched=True, usage=self.HEADROOM,
+                   token_slots={self.LIVE: "1"},
+                   record_usage_headers=lambda num, headers:
+                       recorded.append((num, headers)))
+        self._relay(auth="Bearer " + self.LIVE,
+                    extra_headers=b"anthropic-ratelimit-unified-overage-status: allowed\r\n")
+        assert [num for num, _ in recorded] == ["1"], recorded
+        assert recorded[0][1][
+            "anthropic-ratelimit-unified-overage-status"] == "allowed", recorded
+
     def case_a_switcher_without_the_method_raises_nothing(self, monkeypatch):
         """`_wire`'s default fake switcher has no `record_usage_headers` —
         an older cswap, still installable as a peer.

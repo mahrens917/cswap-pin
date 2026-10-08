@@ -21645,7 +21645,11 @@ def _note_usage_headers(
         k, v = line.split(b":", 1)
         headers[k.strip().lower().decode("latin1", "replace")] = (
             v.strip().decode("latin1", "replace"))
-    if "anthropic-ratelimit-unified-5h-utilization" not in headers:
+    # A reply is worth recording when it carries the 5h window or the
+    # usage-credit (overage) status: claude-swap records each part on its
+    # own, so a reply with only the credit status still updates the spend.
+    if ("anthropic-ratelimit-unified-5h-utilization" not in headers
+            and "anthropic-ratelimit-unified-overage-status" not in headers):
         return
     token = auth.strip()
     token = token[7:].strip() if token[:7].lower() == "bearer " else ""
