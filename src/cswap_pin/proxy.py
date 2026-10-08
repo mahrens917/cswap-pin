@@ -3734,23 +3734,19 @@ def save_pin(backup_root: Path, email: str | None, org_uuid: str | None) -> None
     Lives in its own ``remoteControl`` section; ``save_settings`` preserves
     unknown sections, so autoswitch writes never clobber it.
 
-    Reads through the host's WRITE-side reader, which raises on a malformed
-    file instead of degrading to ``{}``. ``_read_raw``'s degrade is right for
-    a read — a corrupt settings file should not stop the app — but in a
-    read-modify-write it means starting from empty and then writing back only
-    the pin section, silently discarding autoswitch, UI and every unknown key
-    from a file that was probably still hand-recoverable.
+    Reads through the host's one strict reader in its read-modify-write mode
+    (``_read_raw(path, for_write=True)``), which raises on a malformed file
+    instead of degrading to ``{}``: starting from empty and writing back only
+    the ``remoteControl`` section would silently discard autoswitch, UI and
+    every unknown key from a file that was probably still hand-recoverable.
     """
     _settings = require("settings")
 
     path = _settings.settings_path(backup_root)
-    # ``_read_raw_for_write`` is newer than this package's floor on the host,
-    # so fall back rather than fail the pin outright on an older claude-swap.
-    read = getattr(_settings, "_read_raw_for_write", None) or _settings._read_raw
-    raw = read(path)
+    raw = _settings._read_raw(path, for_write=True)
     if email:
         # REBUILD WITH THE PAIR FIRST, NEIGHBOURS CARRIED IN THEIR ORDER.
-        # `_read_raw_for_write` above guards the OUTER dict so a
+        # The strict read above guards the OUTER dict so a
         # read-modify-write cannot discard autoswitch, UI and every unknown
         # section. `remoteControl` is shared too: `debugSlowMs` is read here
         # and written by nobody in this function, so it must survive too.
@@ -21796,8 +21792,8 @@ def _spawn_usage_header_recorder(fn) -> None:
 # and its scope never reaches the usage endpoint, so the only place its
 # token's early death (revoked on claude.ai, or the plan lapsed) shows is a
 # `/v1/messages` reply refusing it. cswap strikes such a slot out of rotation
-# (`record_credential_refused`, `claude_swap.switcher`) when the refused
-# bearer is the LIVE slot's stored token. Only `/v1/messages`: it is the
+# (`record_token_refused`, `claude_swap.switcher`) when the refused bearer is
+# the stored token of the slot that owns it. Only `/v1/messages`: it is the
 # route a setup-token's inference scope is for, so a refusal there is about
 # the token; other routes (the usage endpoint answers every setup-token 403)
 # refuse it by scope and say nothing about whether it is alive.
@@ -21850,16 +21846,16 @@ def _finish_credential_refusal(capture: "_UsageCapture | None",
 
 
 def _note_credential_refused(status: int, auth: str) -> None:
-    """Tell cswap the API refused the request's bearer, when that bearer IS
-    the live slot's stored setup-token.
+    """Tell cswap the API refused the request's bearer.
 
-    A bearer that is not the live token is a session still holding an
-    account cswap has switched away from: its 401 is the existing rebuild
-    path's (the client rebuilds onto the live account), and nothing here
-    strikes the account it names. A live browser login is not reported
-    either: its refresh machinery owns its verdict. Off the relay's thread,
-    for the same reason as `_note_usage_headers`: resolving the live slot
-    can ask the server.
+    cswap charges the refusal to the slot whose stored credential carries
+    the bearer (`record_token_refused`), live or not, and strikes it only
+    when that credential is a setup-token: a setup-token does not rotate, so
+    a refusal of the stored token is its verdict whichever session sent it.
+    A browser login is never struck there: its refresh machinery owns its
+    verdict. A bearer no stored credential carries strikes nothing. Off the
+    relay's thread, for the same reason as `_note_usage_headers`: resolving
+    the token's slot can ask the server.
     """
     token = _bearer_token(auth)
     if not token:
@@ -21877,19 +21873,15 @@ def _note_credential_refused(status: int, auth: str) -> None:
     def _run() -> None:
         try:
             sw = require("switcher").ClaudeAccountSwitcher()
-            slot = sw.current_account_number()
-            raw = sw._read_credentials() or ""
-            oauth = require("oauth")
-            live = oauth.extract_access_token(raw) if raw else None
-            if slot is None or not live or token != live:
-                return
-            if not oauth.is_setup_token_credential(raw):
-                return
-            if not hasattr(sw, "record_credential_refused"):
+            # THE SLOT THAT OWNS THE REQUEST'S OWN TOKEN (cswap resolves it
+            # in `record_token_refused`), never whichever slot is live when
+            # this thread runs: a switch between the reply and this thread
+            # moved the live login, and the live-token match then dropped
+            # the refusal, so a dead setup-token stayed in rotation.
+            if not hasattr(sw, "record_token_refused"):
                 _warn_no_refusal_recorder_once()
                 return
-            sw.record_credential_refused(
-                str(slot), status, oauth.credential_fingerprint(raw))
+            sw.record_token_refused(token, status)
         except Exception as exc:  # noqa: BLE001 -- never let this break the relay
             _log_lifecycle(
                 f"warning: credential-refusal record raised "
@@ -21902,8 +21894,8 @@ def _note_credential_refused(status: int, auth: str) -> None:
 
 def _warn_no_refusal_recorder_once() -> None:
     """Say ONCE per daemon that the installed claude-swap cannot take a
-    refused setup-token (it predates ``record_credential_refused``), so a
-    token that died early stays in rotation."""
+    refused setup-token (it predates ``record_token_refused``), so a token
+    that died early stays in rotation."""
     global _refusal_recorder_missing_warned
     with _usage_header_lock:
         if _refusal_recorder_missing_warned:
@@ -21911,7 +21903,7 @@ def _warn_no_refusal_recorder_once() -> None:
         _refusal_recorder_missing_warned = True
     _log_lifecycle(
         "warning: the installed claude-swap has no "
-        "ClaudeAccountSwitcher.record_credential_refused (it predates that "
+        "ClaudeAccountSwitcher.record_token_refused (it predates that "
         "method), so a setup-token the API refuses is NOT struck out of "
         "rotation; upgrade claude-swap to a build that has it"
     )

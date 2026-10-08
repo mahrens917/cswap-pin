@@ -1,35 +1,22 @@
-"""A refused setup-token on /v1/messages is reported to cswap.
+"""A refused token on /v1/messages is reported to cswap.
 
 The owner proxy sees every `/v1/messages` reply. A 401 (or a 403 whose body
-names an authentication or permission error) on a request whose bearer IS the
-live slot's stored setup-token is the only sign that token died early, so it
-is handed to `ClaudeAccountSwitcher.record_credential_refused`, which strikes
-the slot out of rotation. A stale bearer (a session still on an account cswap
-switched away from) and a browser login are never reported.
+names an authentication or permission error) is the only sign a setup-token
+died early, so the request's own bearer is handed to
+`ClaudeAccountSwitcher.record_token_refused`, which charges it to the slot
+whose stored credential carries that token and strikes it when that
+credential is a setup-token (claude-swap's own tests cover that half). The
+live slot is never consulted: a switch between the reply and the worker
+moves the live login, and reading it dropped the refusal.
 """
 
 import json
 import socket
 import types
 
-import pytest
-
-from claude_swap import oauth as real_oauth
 from cswap_pin import proxy as pp
 
 TOKEN = "sk-ant-oat01-live"
-TOKEN_CREDS = json.dumps(
-    {"claudeAiOauth": {"accessToken": TOKEN, "scopes": ["user:inference"]}}
-)
-BROWSER_CREDS = json.dumps(
-    {
-        "claudeAiOauth": {
-            "accessToken": TOKEN,
-            "refreshToken": "rt",
-            "scopes": ["user:inference", "user:profile"],
-        }
-    }
-)
 AUTH_403 = json.dumps(
     {"type": "error", "error": {"type": "permission_error", "message": "no"}}
 ).encode()
@@ -38,25 +25,30 @@ OTHER_403 = json.dumps(
 ).encode()
 
 
-def _wire(monkeypatch, *, live_creds=TOKEN_CREDS, live_num="2", recorder=True):
-    """Stub cswap's switcher (the real `oauth` module stays); returns the
-    list of `record_credential_refused` calls and the daemon log lines."""
+def _live_slot_read(*_a, **_k):
+    raise AssertionError("the refusal path read the live slot")
+
+
+def _wire(monkeypatch, *, recorder=True):
+    """Stub cswap's switcher; returns the list of `record_token_refused`
+    calls and the daemon log lines. Any read of the live slot fails."""
     calls: list = []
     logged: list = []
     attrs = dict(
-        current_account_number=lambda: live_num,
-        _read_credentials=lambda: live_creds,
+        current_account_number=_live_slot_read,
+        _read_credentials=_live_slot_read,
     )
     if recorder:
-        attrs["record_credential_refused"] = (
-            lambda num, status, fp: calls.append((num, status, fp)) or True
+        attrs["record_token_refused"] = (
+            lambda token, status: calls.append((token, status)) or True
         )
     fake_switcher = types.SimpleNamespace(
         ClaudeAccountSwitcher=lambda: types.SimpleNamespace(**attrs)
     )
 
     def _require(name):
-        return real_oauth if name == "oauth" else fake_switcher
+        assert name == "switcher", name
+        return fake_switcher
 
     monkeypatch.setattr(pp, "require", _require)
     monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn: fn())
@@ -85,14 +77,23 @@ def _relay(status: bytes, body: bytes = b"{}", *, auth=f"Bearer {TOKEN}",
             s.close()
 
 
-def test_a_401_on_the_live_token_slot_is_reported(monkeypatch):
-    """Asserts: a 401 on /v1/messages whose bearer is the live setup-token
-    reaches record_credential_refused with the live slot, the status and the
-    stored credential's fingerprint, and the client still gets the 401."""
+def test_a_401_reports_the_requests_own_token(monkeypatch):
+    """Asserts: a 401 on /v1/messages reaches record_token_refused with the
+    request's own bearer and the status, without reading the live slot, and
+    the client still gets the 401."""
     calls, _ = _wire(monkeypatch)
     got = _relay(b"401 Unauthorized")
     assert got.startswith(b"HTTP/1.1 401"), got[:40]
-    assert calls == [("2", 401, real_oauth.credential_fingerprint(TOKEN_CREDS))]
+    assert calls == [(TOKEN, 401)]
+
+
+def test_a_bearer_cswap_switched_away_from_is_reported_too(monkeypatch):
+    """Asserts: a 401 on a session still holding an account cswap switched
+    away from is reported with that session's own token, so cswap charges
+    it to the account that owns it rather than dropping it."""
+    calls, _ = _wire(monkeypatch)
+    _relay(b"401 Unauthorized", auth="Bearer sk-ant-oat01-old")
+    assert calls == [("sk-ant-oat01-old", 401)]
 
 
 def test_an_auth_typed_403_is_reported_after_its_body(monkeypatch):
@@ -101,7 +102,7 @@ def test_an_auth_typed_403_is_reported_after_its_body(monkeypatch):
     calls, _ = _wire(monkeypatch)
     got = _relay(b"403 Forbidden", AUTH_403)
     assert got.endswith(AUTH_403), got
-    assert [(n, s) for n, s, _ in calls] == [("2", 403)]
+    assert calls == [(TOKEN, 403)]
 
 
 def test_a_403_of_another_type_is_not_reported(monkeypatch):
@@ -109,23 +110,6 @@ def test_a_403_of_another_type_is_not_reported(monkeypatch):
     refuses nothing about the credential."""
     calls, _ = _wire(monkeypatch)
     _relay(b"403 Forbidden", OTHER_403)
-    assert calls == []
-
-
-def test_a_stale_bearer_401_strikes_nothing(monkeypatch):
-    """Asserts: a 401 for a bearer that is not the live slot's token (a
-    session still on an account cswap switched away from) is never
-    reported; the rebuild path owns it."""
-    calls, _ = _wire(monkeypatch)
-    _relay(b"401 Unauthorized", auth="Bearer sk-ant-oat01-old")
-    assert calls == []
-
-
-def test_a_browser_login_is_never_reported(monkeypatch):
-    """Asserts: a 401 on a live browser login (refresh token present) is
-    not reported; its refresh machinery owns its verdict."""
-    calls, _ = _wire(monkeypatch, live_creds=BROWSER_CREDS)
-    _relay(b"401 Unauthorized")
     assert calls == []
 
 
@@ -138,6 +122,13 @@ def test_other_routes_are_not_reported(monkeypatch):
     assert calls == []
 
 
+def test_a_request_with_no_bearer_is_not_reported(monkeypatch):
+    """Asserts: a 401 on a request that carried no bearer names no token."""
+    calls, _ = _wire(monkeypatch)
+    _relay(b"401 Unauthorized", auth="")
+    assert calls == []
+
+
 def test_a_200_is_not_reported(monkeypatch):
     """Asserts: a successful reply reports nothing."""
     calls, _ = _wire(monkeypatch)
@@ -146,29 +137,21 @@ def test_a_200_is_not_reported(monkeypatch):
 
 
 def test_a_host_without_the_method_warns_once(monkeypatch):
-    """Asserts: an installed claude-swap without record_credential_refused
-    gets one daemon-log warning, not one per refusal."""
+    """Asserts: an installed claude-swap without record_token_refused gets
+    one daemon-log warning, not one per refusal."""
     _, logged = _wire(monkeypatch, recorder=False)
     _relay(b"401 Unauthorized")
     pp._refusal_spawn_seen.clear()
     _relay(b"401 Unauthorized")
-    warnings = [line for line in logged if "record_credential_refused" in line]
+    warnings = [line for line in logged if "record_token_refused" in line]
     assert len(warnings) == 1, logged
     assert warnings[0].startswith("warning:")
 
 
 def test_a_burst_on_one_token_resolves_once(monkeypatch):
-    """Asserts: many refusals of one token inside the throttle window
-    resolve the live slot once."""
+    """Asserts: many refusals of one token inside the throttle window are
+    reported once."""
     calls, _ = _wire(monkeypatch)
     for _ in range(3):
         _relay(b"401 Unauthorized")
     assert len(calls) == 1
-
-
-@pytest.mark.parametrize("raw", ["", "not json"])
-def test_an_unreadable_live_credential_reports_nothing(monkeypatch, raw):
-    """Asserts: with no readable live token nothing is attributed."""
-    calls, _ = _wire(monkeypatch, live_creds=raw)
-    _relay(b"401 Unauthorized")
-    assert calls == []
