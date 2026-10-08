@@ -21804,7 +21804,6 @@ _REFUSAL_ERROR_TYPES = frozenset({"authentication_error", "permission_error"})
 # idempotent, so a refusal inside the window loses nothing.
 _refusal_spawn_seen: dict[str, float] = {}
 _REFUSAL_THROTTLE_S = 30.0
-_refusal_recorder_missing_warned = False
 
 
 def _bearer_token(auth: str) -> str:
@@ -21878,9 +21877,6 @@ def _note_credential_refused(status: int, auth: str) -> None:
             # this thread runs: a switch between the reply and this thread
             # moved the live login, and the live-token match then dropped
             # the refusal, so a dead setup-token stayed in rotation.
-            if not hasattr(sw, "record_token_refused"):
-                _warn_no_refusal_recorder_once()
-                return
             sw.record_token_refused(token, status)
         except Exception as exc:  # noqa: BLE001 -- never let this break the relay
             _log_lifecycle(
@@ -21890,23 +21886,6 @@ def _note_credential_refused(status: int, auth: str) -> None:
             )
 
     _spawn_usage_header_recorder(_run)
-
-
-def _warn_no_refusal_recorder_once() -> None:
-    """Say ONCE per daemon that the installed claude-swap cannot take a
-    refused setup-token (it predates ``record_token_refused``), so a token
-    that died early stays in rotation."""
-    global _refusal_recorder_missing_warned
-    with _usage_header_lock:
-        if _refusal_recorder_missing_warned:
-            return
-        _refusal_recorder_missing_warned = True
-    _log_lifecycle(
-        "warning: the installed claude-swap has no "
-        "ClaudeAccountSwitcher.record_token_refused (it predates that "
-        "method), so a setup-token the API refuses is NOT struck out of "
-        "rotation; upgrade claude-swap to a build that has it"
-    )
 
 
 # CLAUDE CODE'S OWN USAGE READS. Claude Code sends `GET /api/oauth/usage`

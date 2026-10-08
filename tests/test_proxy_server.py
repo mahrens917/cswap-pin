@@ -949,6 +949,32 @@ class TestPinProxyServer:
 
         monkeypatch.setattr(pp.PinProxy, "_hold_bridge_attach", _spy_hold)
 
+        # THE CLOSE MUST LAND BEFORE THE CHECK RUNS. With nothing to wait on
+        # at the hold, the proxy reaches `_client_hung_up` as soon as it has
+        # read the body, and a client still connected at that instant is
+        # rightly relayed: the request was sent by a live client. Ungated,
+        # this case raced the client's own `close()` (and, under load, the
+        # kernel's delivery of its FIN) against the proxy's read, and lost
+        # once when both suites ran at once. So the check waits until the
+        # client has closed, then asks the real check until the close is
+        # visible on the proxy's socket (bounded). A proxy that skips the
+        # check on a first attempt never reaches this and relays.
+        abandoned = threading.Event()
+        checked: list[bool] = []
+        real_hung_up = pp._client_hung_up
+
+        def _after_close(sock):
+            assert abandoned.wait(5), "the client never finished closing"
+            deadline = time.monotonic() + 5
+            verdict = real_hung_up(sock)
+            while not verdict and time.monotonic() < deadline:
+                time.sleep(0.01)
+                verdict = real_hung_up(sock)
+            checked.append(verdict)
+            return verdict
+
+        monkeypatch.setattr(pp, "_client_hung_up", _after_close)
+
         upstream = _StallableBridgeUpstream(certdir)
         proxy = pp.PinProxy(certdir=certdir, pin_token_provider=lambda: "TESTTOK",
                             upstream=("127.0.0.1", upstream.port))
@@ -956,7 +982,14 @@ class TestPinProxyServer:
         try:
             _post_and_abandon(proxy.port, certdir / "ca.pem",
                               "/v1/code/sessions/cse_first/bridge", "FIRST")
-            time.sleep(0.5)  # let the abandoned send actually land
+            abandoned.set()
+            deadline = time.monotonic() + 5
+            while not checked and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert checked == [True], (
+                "the hung-up check never ran on the first attempt, or never "
+                f"saw the client's close: {checked}")
+            time.sleep(0.5)  # a relay, if one were coming, reaches upstream
             assert upstream.received == [], (
                 "a first attempt (no earlier hold entry) whose client "
                 f"hung up was relayed anyway: {upstream.received}")

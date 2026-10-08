@@ -53,7 +53,6 @@ def _wire(monkeypatch, *, recorder=True):
     monkeypatch.setattr(pp, "require", _require)
     monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn: fn())
     monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
-    monkeypatch.setattr(pp, "_refusal_recorder_missing_warned", False)
     pp._refusal_spawn_seen.clear()
     return calls, logged
 
@@ -136,16 +135,17 @@ def test_a_200_is_not_reported(monkeypatch):
     assert calls == []
 
 
-def test_a_host_without_the_method_warns_once(monkeypatch):
-    """Asserts: an installed claude-swap without record_token_refused gets
-    one daemon-log warning, not one per refusal."""
+def test_the_recorder_is_called_directly_with_no_presence_check(monkeypatch):
+    """Asserts: the refusal path calls `record_token_refused` with no
+    presence check, so a switcher lacking it raises AttributeError into the
+    path's own error line (claude-swap and the proxy deploy together; there
+    is no older-host branch to take)."""
     _, logged = _wire(monkeypatch, recorder=False)
     _relay(b"401 Unauthorized")
-    pp._refusal_spawn_seen.clear()
-    _relay(b"401 Unauthorized")
-    warnings = [line for line in logged if "record_token_refused" in line]
-    assert len(warnings) == 1, logged
-    assert warnings[0].startswith("warning:")
+    assert logged == [
+        "warning: credential-refusal record raised AttributeError, so a "
+        "refused setup-token (http-401) was not struck out of rotation"
+    ], logged
 
 
 def test_a_burst_on_one_token_resolves_once(monkeypatch):
