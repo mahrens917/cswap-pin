@@ -17554,6 +17554,48 @@ class TestA429OnMessagesBecomesA401OnceCswapHasWalledTheAccount:
             assert got.startswith(b"HTTP/1.1 429"), got[:40]
         assert len(calls) == 1, len(calls)
 
+    def case_a_stale_build_refusal_relays_the_wall_and_stops_switching(
+        self, monkeypatch,
+    ):
+        """Asserts: when claude-swap refuses the wall switch's writes because
+        this process loaded an older build than the one installed (X3697),
+        the client gets the 429 a raising switch gets (no crash, no 401),
+        recording stops with ONE WARNING naming both builds, and a later wall
+        relays its 429 without calling `switch()` again, even after the
+        raise memo expired."""
+        from pathlib import Path as _Path
+
+        from claude_swap import locking
+        from cswap_pin import proxy as pp
+
+        stale = locking.StaleBuildWriteError(
+            _Path("/home/u/.local/share/claude-swap"),
+            locking.Build("0" * 64, "0.26.0 (source sha256 000000000000)"),
+            locking.Build("1" * 64, "0.27.0b1 (source sha256 111111111111)"),
+        )
+
+        def _refused():
+            raise stale
+
+        monkeypatch.setattr(pp, "_WALLED_SWITCH_RAISE_TTL", 0.0)
+        monkeypatch.setattr(pp, "_store_writes_refused", False)
+        calls = self._wire(monkeypatch, switched=True, before=_refused)
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        first = self._relay()
+        assert first.startswith(b"HTTP/1.1 429"), first[:40]
+        assert pp._store_writes_stopped() is True
+        second = self._relay(reset=b"anthropic-ratelimit-unified-reset: 9999999998")
+        assert second.startswith(b"HTTP/1.1 429"), second[:40]
+        assert len(calls) == 1, f"a stopped process called switch() again: {calls}"
+        warnings = [line for line in logged if line.startswith("WARNING")]
+        assert len(warnings) == 1, logged
+        assert "and so did wall switches" in warnings[0]
+        assert "this process loaded build 0.26.0" in warnings[0]
+        assert "build 0.27.0b1" in warnings[0]
+        assert any("switches nothing; relaying the 429 with headers stripped"
+                   in line for line in logged), logged
+
     def case_needs_login_is_not_a_usable_switch(self, monkeypatch):
         """switched=True with needsLogin=True means the credential is gone,
         not moved to a usable one — a 401 here dies on auth instead of
@@ -20048,3 +20090,35 @@ class TestStaleBuildStopsRecording:
                                "/v1/messages", "Bearer tok-g")
         assert pp._store_writes_stopped() is False
         assert logged == ["usage-header record raised RuntimeError, dropped"]
+
+    def test_a_build_unreadable_mid_install_stops_recording(
+        self, monkeypatch, tmp_path
+    ):
+        """Asserts: when claude-swap's real build check finds a package file
+        gone mid-install (the installed build cannot be read), the record is
+        refused as stale rather than raised as an OSError, recording stops,
+        and the one WARNING says the installed build cannot be read."""
+        from claude_swap import locking
+
+        pp, made, logged = self._wire(monkeypatch)
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "a.py").write_text("A = 1\n", encoding="utf-8")
+        monkeypatch.setattr(locking, "_PACKAGE_DIR", package)
+        monkeypatch.setattr(locking, "_installed_cache", None)
+        monkeypatch.setattr(locking, "_refusal_warned", set())
+        monkeypatch.setattr(locking, "_source_files",
+                            lambda d: [package / "a.py", package / "b.py"])
+        fake = pp.require("switcher")
+
+        def _checked_write(self, slot, headers):
+            locking.check_loaded_build_is_installed(tmp_path / "usage-v4.json")
+
+        monkeypatch.setattr(fake.ClaudeAccountSwitcher, "record_usage_headers",
+                            _checked_write)
+        pp._note_usage_headers(self._HEADERS[0], self._HEADERS,
+                               "/v1/messages", "Bearer tok-h")
+        assert pp._store_writes_stopped() is True
+        assert len(logged) == 1, logged
+        assert logged[0].startswith("WARNING usage and credential-refusal")
+        assert "the installed build cannot be read" in logged[0]

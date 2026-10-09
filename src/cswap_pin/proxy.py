@@ -21468,6 +21468,22 @@ def _switch_off_walled_account(
                 _walled_slots[slot] = float(reset)
             except ValueError:
                 pass
+        # A STALE BUILD SWITCHES NOTHING (X3697). `switch()` writes the live
+        # credential and `sequence.json`, which every other cswap process
+        # shares, and claude-swap refuses that write from a process whose
+        # loaded build is no longer the installed one. Once this process has
+        # been refused (by a switch or by a recorder), it relays the wall the
+        # way it does when no switch landed, without asking `switch()` again;
+        # the processes running the installed build do the switching.
+        if _store_writes_stopped():
+            _log_lifecycle(
+                "429 on /v1/messages -- this process's claude-swap build is "
+                "no longer the installed one, so it switches nothing; "
+                "relaying the 429 with headers stripped"
+            )
+            _fleet_exhausted_until = 0.0
+            _remember_walled_switch(key, False, cap_epoch)
+            return False
         try:
             switcher = require("switcher")
             # NOT `switch_off_at_limit_account`, which passes no `models` and
@@ -21508,7 +21524,14 @@ def _switch_off_walled_account(
                     del _walled_slots[expired]
                 switch_kwargs["exclude"] = frozenset(_walled_slots)
             result = switcher.ClaudeAccountSwitcher().switch(**switch_kwargs)
-        except Exception as exc:  # noqa: BLE001 — never let this break the relay
+        except Exception as exc:  # noqa: BLE001 -- never let this break the relay
+            if _stop_store_writes_on_stale_build(exc):
+                # Said once, at WARNING, by the call above; the reply is the
+                # one a raising switch gets, and later walls take the
+                # `_store_writes_stopped` return before `switch()`.
+                _fleet_exhausted_until = 0.0
+                _remember_walled_switch(key, False, cap_epoch)
+                return False
             _log_lifecycle(
                 f"429 on /v1/messages — the at-limit switch raised "
                 f"{exc.__class__.__name__}, relaying the 429 with headers "
@@ -21729,14 +21752,16 @@ def _note_usage_headers(
 
 
 # Set once, under `_usage_header_lock`, when this process's claude-swap
-# refused a usage-store write because the build it loaded is no longer the
-# one installed (claude-swap's `locking.StaleBuildWriteError`, X3697). The
+# refused a shared write (the usage store, or a wall switch's credential and
+# `sequence.json` writes) because the build it loaded is no longer the one
+# installed (claude-swap's `locking.StaleBuildWriteError`, X3697). The
 # proxy imports claude-swap into its own process, so a process that outlives
 # an install (the draining process above all) keeps the old build's code;
 # its writes beside the new build's are what emptied the store on
 # 2026-10-08. From then on this process records no usage reading, usage
-# reply or credential refusal, and keeps relaying on its connections: the
-# processes of the installed build do the recording.
+# reply or credential refusal, switches off no wall, and keeps relaying on
+# its connections: the processes of the installed build do the recording
+# and the switching.
 _store_writes_refused = False
 
 
@@ -21747,8 +21772,9 @@ def _store_writes_stopped() -> bool:
 
 def _stop_store_writes_on_stale_build(exc: BaseException) -> bool:
     """True when ``exc`` is claude-swap's refusal of a write from a stale
-    build; recording then stops for the life of this process, said once at
-    WARNING. False for any other error, which the caller reports as before."""
+    build; recording and wall switching then stop for the life of this
+    process, said once at WARNING. False for any other error, which the
+    caller reports as before."""
     global _store_writes_refused
     if not isinstance(exc, locking.StaleBuildWriteError):
         return False
@@ -21758,8 +21784,9 @@ def _stop_store_writes_on_stale_build(exc: BaseException) -> bool:
     if first:
         _log_lifecycle(
             f"WARNING usage and credential-refusal recording stopped in this "
-            f"process (pid {os.getpid()}): {exc}; its connections stay up and "
-            "the processes running the installed build record from here")
+            f"process (pid {os.getpid()}), and so did wall switches: {exc}; "
+            "its connections stay up and the processes running the installed "
+            "build record and switch from here")
     return True
 
 
