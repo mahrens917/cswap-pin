@@ -53,6 +53,10 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from cswap_pin._host import require
 
 oauth = require("oauth")
+# claude-swap's file lock and build check; `StaleBuildWriteError` is how its
+# store refuses a write from this process once an install replaced the build
+# it loaded (`_stop_store_writes_on_stale_build`).
+locking = require("locking")
 
 
 class _Chain(NamedTuple):
@@ -19349,6 +19353,11 @@ class PinProxy:
         keep = not any(k.lower() == "connection" and "close" in v.lower()
                        for k, v in headers)
         variant = query
+        if _store_writes_stopped():
+            # This process's build is stale and records nothing (said once
+            # by `_stop_store_writes_on_stale_build`): the request goes
+            # upstream uncounted.
+            return None, None
         try:
             usage_store = require("usage_store")
             variant = usage_store.usage_variant(query)
@@ -19362,6 +19371,8 @@ class PinProxy:
             sw = require("switcher").ClaudeAccountSwitcher()
             answer = sw.answer_client_usage(slot, variant)
         except Exception as exc:  # noqa: BLE001 -- the request still goes
+            if _stop_store_writes_on_stale_build(exc):
+                return None, None
             _log_lifecycle(
                 f"WARNING usage request ({variant}) forwarded uncounted: "
                 f"cswap's account or usage store raised "
@@ -19413,7 +19424,7 @@ class PinProxy:
         reading that never arrived."""
         sw, slot, variant, capture = forward
         status = capture.status
-        if status not in (200, 429):
+        if status not in (200, 429) or _store_writes_stopped():
             return
         body = capture.json_body() if status == 200 else None
         if status == 200 and body is None:
@@ -19427,6 +19438,8 @@ class PinProxy:
                 slot, variant, status=status, body=body,
                 retry_after_s=capture.retry_after_s())
         except Exception as exc:  # noqa: BLE001 -- the reply already went
+            if _stop_store_writes_on_stale_build(exc):
+                return
             _log_lifecycle(
                 f"WARNING usage reply on account {slot} ({variant}) not "
                 f"recorded: cswap's usage store raised "
@@ -21666,6 +21679,8 @@ def _note_usage_headers(
             del _usage_header_spawn_seen[next(iter(_usage_header_spawn_seen))]
 
     def _run() -> None:
+        if _store_writes_stopped():
+            return
         try:
             sw = require("switcher").ClaudeAccountSwitcher()
             # THE SLOT THAT OWNS THE REQUEST'S OWN TOKEN, never whichever
@@ -21703,12 +21718,49 @@ def _note_usage_headers(
                 return
             sw.record_usage_headers(slot, headers)
         except Exception as exc:  # noqa: BLE001 — never let this break the relay
+            if _stop_store_writes_on_stale_build(exc):
+                return
             _log_lifecycle(
                 f"usage-header record raised {exc.__class__.__name__}, "
                 "dropped"
             )
 
     _spawn_usage_header_recorder(_run)
+
+
+# Set once, under `_usage_header_lock`, when this process's claude-swap
+# refused a usage-store write because the build it loaded is no longer the
+# one installed (claude-swap's `locking.StaleBuildWriteError`, X3697). The
+# proxy imports claude-swap into its own process, so a process that outlives
+# an install (the draining process above all) keeps the old build's code;
+# its writes beside the new build's are what emptied the store on
+# 2026-10-08. From then on this process records no usage reading, usage
+# reply or credential refusal, and keeps relaying on its connections: the
+# processes of the installed build do the recording.
+_store_writes_refused = False
+
+
+def _store_writes_stopped() -> bool:
+    with _usage_header_lock:
+        return _store_writes_refused
+
+
+def _stop_store_writes_on_stale_build(exc: BaseException) -> bool:
+    """True when ``exc`` is claude-swap's refusal of a write from a stale
+    build; recording then stops for the life of this process, said once at
+    WARNING. False for any other error, which the caller reports as before."""
+    global _store_writes_refused
+    if not isinstance(exc, locking.StaleBuildWriteError):
+        return False
+    with _usage_header_lock:
+        first = not _store_writes_refused
+        _store_writes_refused = True
+    if first:
+        _log_lifecycle(
+            f"WARNING usage and credential-refusal recording stopped in this "
+            f"process (pid {os.getpid()}): {exc}; its connections stay up and "
+            "the processes running the installed build record from here")
+    return True
 
 
 # Set by the first `_warn_no_usage_recorder_once` in this process, under
@@ -21874,6 +21926,8 @@ def _note_credential_refused(status: int, auth: str) -> None:
             del _refusal_spawn_seen[next(iter(_refusal_spawn_seen))]
 
     def _run() -> None:
+        if _store_writes_stopped():
+            return
         try:
             sw = require("switcher").ClaudeAccountSwitcher()
             # THE SLOT THAT OWNS THE REQUEST'S OWN TOKEN (cswap resolves it
@@ -21883,6 +21937,8 @@ def _note_credential_refused(status: int, auth: str) -> None:
             # the refusal, so a dead setup-token stayed in rotation.
             sw.record_token_refused(token, status)
         except Exception as exc:  # noqa: BLE001 -- never let this break the relay
+            if _stop_store_writes_on_stale_build(exc):
+                return
             _log_lifecycle(
                 f"warning: credential-refusal record raised "
                 f"{exc.__class__.__name__}, so a refused setup-token "

@@ -19911,3 +19911,140 @@ class TestClaudeCodesUsageRequestsAreCounted:
             "GET /api/oauth/usage_history HTTP/1.1", tls)
         assert calls == []
         assert pp._USAGE_ROUTE == "/api/oauth/usage"
+
+
+class TestStaleBuildStopsRecording:
+    """X3697: a proxy process whose loaded claude-swap build is no longer the
+    installed one (the draining process across an install) gets claude-swap's
+    `StaleBuildWriteError` on its first store write, then records no usage
+    and no credential refusal for the rest of its life, saying so once."""
+
+    _HEADERS = [b"HTTP/1.1 200 OK",
+                b"anthropic-ratelimit-unified-5h-utilization: 0.42"]
+
+    @staticmethod
+    def _stale_error():
+        from pathlib import Path as _Path
+
+        from claude_swap import locking
+
+        return locking.StaleBuildWriteError(
+            _Path("/tmp/cache/usage-v4.json"),
+            locking.Build("0" * 64, "0.26.0 (source sha256 000000000000)"),
+            locking.Build("1" * 64, "0.27.0b1 (source sha256 111111111111)"),
+        )
+
+    def _wire(self, monkeypatch):
+        """A fake claude-swap whose every store write is refused as stale,
+        with each switcher construction and call counted, the recorder
+        thread run inline, and the lifecycle log captured."""
+        import importlib
+        import types as _types
+
+        from cswap_pin import proxy as pp
+
+        made = []
+        stale = self._stale_error()
+
+        class _Switcher:
+            def __init__(self):
+                made.append(self)
+
+            def slot_for_access_token(self, token):
+                return "1"
+
+            def record_usage_headers(self, slot, headers):
+                raise stale
+
+            def record_token_refused(self, token, status):
+                raise stale
+
+            def answer_client_usage(self, slot, variant):
+                raise stale
+
+            def record_client_usage(self, slot, variant, **kw):
+                raise stale
+
+        fake = _types.SimpleNamespace(ClaudeAccountSwitcher=_Switcher)
+        monkeypatch.setattr(
+            pp, "require",
+            lambda name: fake if name == "switcher"
+            else importlib.import_module(f"claude_swap.{name}"))
+        monkeypatch.setattr(pp, "_spawn_usage_header_recorder", lambda fn: fn())
+        monkeypatch.setattr(pp, "_store_writes_refused", False)
+        monkeypatch.setattr(pp, "_usage_request_slot", lambda auth: "1")
+        pp._usage_header_seen.clear()
+        pp._usage_header_spawn_seen.clear()
+        pp._refusal_spawn_seen.clear()
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        return pp, made, logged
+
+    def test_the_first_refusal_stops_every_recorder_and_logs_once(self, monkeypatch):
+        """Asserts: after a usage-header record is refused as stale, a
+        credential refusal, a usage request and a usage reply record
+        nothing (no switcher is even built), the usage request goes
+        upstream uncounted, and exactly one WARNING names both builds."""
+        pp, made, logged = self._wire(monkeypatch)
+        pp._note_usage_headers(self._HEADERS[0], self._HEADERS,
+                               "/v1/messages", "Bearer tok-a")
+        assert len(made) == 1
+        assert pp._store_writes_stopped() is True
+        pp._note_credential_refused(401, "Bearer tok-b")
+        pp._note_usage_headers(self._HEADERS[0], self._HEADERS,
+                               "/v1/messages", "Bearer tok-c")
+        keep, forward = pp.PinProxy._gate_usage_request(
+            None, "/api/oauth/usage", [("Authorization", "Bearer tok-d")], None)
+        assert (keep, forward) == (None, None)
+        assert len(made) == 1, "a stopped process built a switcher again"
+        assert len(logged) == 1, logged
+        line = logged[0]
+        assert line.startswith("WARNING usage and credential-refusal recording stopped")
+        assert "this process loaded build 0.26.0" in line
+        assert "build 0.27.0b1" in line
+        assert "connections stay up" in line
+
+    def test_a_refused_credential_record_stops_recording(self, monkeypatch):
+        """Asserts: the refusal recorder's own stale refusal stops recording
+        and logs the one WARNING, not the per-refusal warning line."""
+        pp, made, logged = self._wire(monkeypatch)
+        pp._note_credential_refused(401, "Bearer tok-e")
+        assert pp._store_writes_stopped() is True
+        assert len(logged) == 1 and "recording stopped" in logged[0], logged
+
+    def test_a_refused_usage_request_goes_upstream_uncounted(self, monkeypatch):
+        """Asserts: a stale refusal from the usage-request gate stops
+        recording and forwards the request uncounted, with the one WARNING
+        rather than the per-request uncounted line."""
+        pp, made, logged = self._wire(monkeypatch)
+        keep, forward = pp.PinProxy._gate_usage_request(
+            None, "/api/oauth/usage", [("Authorization", "Bearer tok-f")], None)
+        assert (keep, forward) == (None, None)
+        assert pp._store_writes_stopped() is True
+        assert len(logged) == 1 and "recording stopped" in logged[0], logged
+
+    def test_a_refused_usage_reply_stops_recording(self, monkeypatch):
+        """Asserts: a stale refusal while recording a forwarded usage reply
+        stops recording with the one WARNING."""
+        pp, made, logged = self._wire(monkeypatch)
+        capture = pp._UsageCapture()
+        capture.status = 429
+        sw = pp.require("switcher").ClaudeAccountSwitcher()
+        pp.PinProxy._record_usage_reply(pp._UsageForward(sw, "1", "plain", capture))
+        assert pp._store_writes_stopped() is True
+        assert len(logged) == 1 and "recording stopped" in logged[0], logged
+
+    def test_any_other_error_keeps_recording(self, monkeypatch):
+        """Asserts: an error that is not the stale-build refusal is reported
+        as before and recording continues."""
+        pp, made, logged = self._wire(monkeypatch)
+        fake = pp.require("switcher")
+
+        def _boom(self, slot, headers):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(fake.ClaudeAccountSwitcher, "record_usage_headers", _boom)
+        pp._note_usage_headers(self._HEADERS[0], self._HEADERS,
+                               "/v1/messages", "Bearer tok-g")
+        assert pp._store_writes_stopped() is False
+        assert logged == ["usage-header record raised RuntimeError, dropped"]
