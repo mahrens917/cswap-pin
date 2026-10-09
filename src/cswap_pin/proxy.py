@@ -7472,12 +7472,11 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
         # waiting for it to appear.
         settling = read_daemon_state(certdir)
         if settling and settling.get("handover"):
-            for _ in range(int(_SPAWN_WAIT_S * 10)):
-                time.sleep(0.1)
-                port = _read_alive_port(certdir, fingerprint=fp)
-                if port is not None:
-                    wire_global_config(port, ca)
-                    return port, ca
+            port = _poll_until_spawn_deadline(
+                lambda: _read_alive_port(certdir, fingerprint=fp))
+            if port is not None:
+                wire_global_config(port, ca)
+                return port, ca
 
         # A daemon exists but is stale (wrong account, or redeployed code) —
         # recycle it before spawning, so a redeploy/repin takes effect instead
@@ -7503,12 +7502,11 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
                 _write_port_hint(certdir, stale["port"])
             if _recycle_daemon(certdir, int(stale["pid"])):
                 # THE HOLDER OWNS THE REPLACEMENT.
-                for _ in range(int(_SPAWN_WAIT_S * 10)):
-                    port = _read_alive_port(certdir)
-                    if port is not None:
-                        wire_global_config(port, ca)
-                        return port, ca
-                    time.sleep(0.1)
+                port = _poll_until_spawn_deadline(
+                    lambda: _read_alive_port(certdir))
+                if port is not None:
+                    wire_global_config(port, ca)
+                    return port, ca
         elif (stale and isinstance(stale.get("port"), int)
               and _health_pid(stale["port"]) == int(stale["pid"])):
             # INVISIBLE HERE IS NOT DEAD. `_pin_daemon_pids` asked `ps` in
@@ -8240,6 +8238,9 @@ _TRACE_CACHE: dict = {}
 # How long `_spawn_daemon` waits for a successor to publish. 10s because a
 # FIRST run generates an RSA key pair before it can serve.
 _SPAWN_WAIT_S = 10.0
+# How often a wait bounded by `_SPAWN_WAIT_S` re-asks whether the successor
+# has published. A spacing between probes only; the wait itself is a deadline.
+_SPAWN_POLL_S = 0.1
 # The pin's OWN settings, in the pin's OWN directory. Settings for an optional
 # feature do not belong in another program's exclusive file, and a user who
 # wanted a fixed port had nowhere to say so.
@@ -9903,7 +9904,7 @@ def _await_successor_state(
     when this function is DEFINED, so a test (or any caller) patching the
     module attribute afterwards would have no effect.
     """
-    for _ in range(int(_SPAWN_WAIT_S * 10)):
+    def _successor_seen() -> "bool | None":
         successor = read_daemon_state(certdir)
         if successor:
             pid = int(successor.get("pid") or 0)
@@ -9911,8 +9912,36 @@ def _await_successor_state(
                     and (fingerprint is None
                          or successor.get("fingerprint") == fingerprint)):
                 return True
-        time.sleep(0.1)
-    return False
+        return None
+
+    return _poll_until_spawn_deadline(_successor_seen) is not None
+
+
+def _poll_until_spawn_deadline(probe: "Callable[[], object]") -> object:
+    """The first non-None ``probe()`` within ``_SPAWN_WAIT_S`` of this call,
+    or None once that much wall time has passed with none.
+
+    A DEADLINE, NOT A TICK COUNT. These waits were ``int(_SPAWN_WAIT_S * 10)``
+    rounds of probe-then-sleep(0.1), which is a wall time only when the probe
+    costs nothing; every round costs 0.1s plus its probe, so a probe that
+    connects to a port or reads a file on a loaded machine stretches the same
+    count past the named wait by the sum of every probe's cost.
+    Measured against the clock, the wait means ``_SPAWN_WAIT_S`` whatever each
+    probe costs, overshooting by at most one probe.
+
+    The probe runs once more after the last sleep, so a successor publishing
+    in the final tick is still seen. ``_SPAWN_WAIT_S`` is read here, at call
+    time, so a caller patching the module attribute is honoured.
+    """
+    deadline = time.monotonic() + _SPAWN_WAIT_S
+    while True:
+        found = probe()
+        if found is not None:
+            return found
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        time.sleep(min(_SPAWN_POLL_S, left))
 
 
 def _serving_daemon_ungated(certdir: Path | None) -> bool:
@@ -12087,7 +12116,8 @@ def _spawn_daemon(
             str(certdir)]
     try:
         try:
-            subprocess.Popen(
+            spawned_at = time.monotonic()
+            holder_proc = subprocess.Popen(
                 argv,
                 env=env,
                 pass_fds=pass_fds,
@@ -12112,17 +12142,25 @@ def _spawn_daemon(
         # stubs Popen (no child ever appears) then paid the full 10s — 10% of
         # the whole suite in one case that is only asserting what the spawn
         # PASSES, not that it works.
-        for _ in range(int(_SPAWN_WAIT_S * 10)):
-            port = _read_alive_port(certdir)
-            if port is not None:
-                # New daemon is serving and recorded in proxy.json — sweep any
-                # orphan pin daemons for this certdir that aren't the keeper, so
-                # a recycle that left the old one alive never accumulates.
-                st = read_daemon_state(certdir)
-                keep = int(st["pid"]) if st else -1
-                _sweep_orphan_daemons(certdir, keep_pid=keep)
-                return port
-            time.sleep(0.1)
+        port = _poll_until_spawn_deadline(lambda: _read_alive_port(certdir))
+        if port is not None:
+            # New daemon is serving and recorded in proxy.json -- sweep any
+            # orphan daemons for this certdir that aren't the keeper, so a
+            # recycle that left the old one alive never accumulates.
+            st = read_daemon_state(certdir)
+            keep = int(st["pid"]) if st else -1
+            _sweep_orphan_daemons(certdir, keep_pid=keep)
+            return port
+        # SLOW IS NOT FAILED, and the journal has to say which. A holder still
+        # running when the wait ends is a successor still starting (two fresh
+        # interpreters in series, an RSA key on a first run); a holder that has
+        # exited is a start that failed. `poll()` reaps it in the second case.
+        holder_alive = holder_proc.poll() is None
+        _log_lifecycle(
+            f"WARNING successor for {certdir} not serving after "
+            f"{time.monotonic() - spawned_at:.1f}s (wait {_SPAWN_WAIT_S}s): "
+            f"holder pid {holder_proc.pid} "
+            f"{'still running' if holder_alive else 'exited'}")
     except BaseException:
         # A spawn that RAISES (fork() EAGAIN under a post-deploy herd) leaves
         # no successor, so the mark must not outlive it — see below.

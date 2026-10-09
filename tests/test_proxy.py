@@ -11501,9 +11501,7 @@ class TestDaemonPortStability:
         finally:
             probe.close()
 
-    def case_a_real_spawned_successor_drops_no_connection(
-        self, tmp_path, monkeypatch
-    ):
+    def case_a_real_spawned_successor_drops_no_connection(self, tmp_path):
         """THE WHOLE PROPERTY, end to end, with a REAL successor process.
 
         The in-process test above proves the socket is handed over and the
@@ -11529,12 +11527,15 @@ class TestDaemonPortStability:
         from cswap_pin import proxy as pin_proxy
         from cswap_pin.proxy import PinProxy, ensure_ca
 
-        # BOUND THE SPAWN WAIT. `_spawn_daemon` polls for up to 10s, and a
-        # successor that publishes late is born AFTER this case has finished
-        # reaping — measured, processes 11s younger than a reap that reported
-        # nothing left. The successor here comes up in well under a second when
-        # it comes up at all, so the remaining 9s only buys orphans.
-        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 1.0)
+        # THE PRODUCTION WAIT, NOT A CUT ONE. This case once cut
+        # `_SPAWN_WAIT_S` to 1.0s, and under the suite's workers with the
+        # hammer below connecting every ~2ms the successor (a holder, then the
+        # daemon, two fresh interpreters in series) sometimes took longer, so
+        # the spawn gave up and the assert read "came up on None" for a
+        # handover that was working. The wait ends the moment the successor
+        # publishes, so the full budget costs time only when it is slow.
+        # Orphans from a successor born after the reap are caught at birth by
+        # the Popen tracking below, not by shortening the wait.
 
         arms = []
         children = []
@@ -12086,8 +12087,14 @@ print("OK", port)
         seen = {}
 
         class _P:
+            pid = 4242
+
             def __init__(self, *a, **kw):
                 seen.update(kw)
+
+            # The spawn gives up below and asks whether its holder is alive.
+            def poll(self):
+                return None  # still running
 
         monkeypatch.setattr(pin_proxy.__dict__.get("subprocess", None) or
                             __import__("subprocess"), "Popen", _P)
@@ -12661,6 +12668,109 @@ print("OK", port)
             f"a raising load_pin did not fall back to the old in-place "
             f"promotion: {promoted}"
         )
+
+    @staticmethod
+    def _stub_spawn(monkeypatch, pin_proxy, probe, holder_exit):
+        """Stub what `_spawn_daemon` reaches past the wait: a Popen whose
+        `poll()` answers `holder_exit`, `probe` as `_read_alive_port`, and no
+        record or sweep."""
+        import subprocess
+
+        class _P:
+            pid = 4242
+
+            def __init__(self, *a, **kw):
+                pass
+
+            def poll(self):
+                return holder_exit
+
+        monkeypatch.setattr(subprocess, "Popen", _P)
+        monkeypatch.setattr(pin_proxy, "_read_alive_port", probe)
+        monkeypatch.setattr(pin_proxy, "read_daemon_state", lambda *a, **k: None)
+        monkeypatch.setattr(pin_proxy, "_sweep_orphan_daemons",
+                            lambda *a, **k: None)
+
+    def case_spawn_finds_a_successor_publishing_late_whatever_the_probe_costs(
+            self, tmp_path, monkeypatch):
+        """Asserts: a successor that publishes 1.5s after the spawn is found
+        under a 2s wait even when every probe costs 0.4s.
+
+        The wait is measured on the clock from the spawn, so how long each
+        probe takes changes how many probes fit, never how long the spawn
+        waits for the successor."""
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 2.0)
+        t0 = time.monotonic()
+
+        def _slow_probe(*a, **k):
+            time.sleep(0.4)
+            return 4321 if time.monotonic() - t0 >= 1.5 else None
+
+        self._stub_spawn(monkeypatch, pin_proxy, _slow_probe, holder_exit=None)
+        certdir = tmp_path / "certs"
+        certdir.mkdir()
+        port = pin_proxy._spawn_daemon("1", "a@b.c", certdir)
+        assert port == 4321, f"the late successor was missed: {port!r}"
+
+    def case_spawn_gives_up_on_the_clock_and_says_the_holder_is_running(
+            self, tmp_path, monkeypatch, capsys):
+        """Asserts: with no successor and a 0.4s probe, the spawn gives up
+        about 2s after it started (one probe past the 2s wait at most), and
+        logs one WARNING naming the elapsed seconds, the wait and that the
+        holder is still running.
+
+        A count of 20 probe-and-sleep(0.1) rounds would have waited 10s here,
+        five times the named wait, which is the reading this rules out."""
+        import time
+
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 2.0)
+
+        def _slow_never(*a, **k):
+            time.sleep(0.4)
+
+        self._stub_spawn(monkeypatch, pin_proxy, _slow_never, holder_exit=None)
+        certdir = tmp_path / "certs"
+        certdir.mkdir()
+        capsys.readouterr()
+        t0 = time.monotonic()
+        port = pin_proxy._spawn_daemon("1", "a@b.c", certdir)
+        elapsed = time.monotonic() - t0
+        assert port is None, port
+        assert 2.0 <= elapsed < 3.0, (
+            f"the spawn waited {elapsed:.2f}s for a 2s wait")
+        lines = [ln for ln in capsys.readouterr().err.splitlines()
+                 if "WARNING successor" in ln]
+        assert len(lines) == 1, lines
+        line = lines[0]
+        assert f"for {certdir} not serving after " in line, line
+        reported = float(line.split(" not serving after ")[1].split("s ")[0])
+        assert 2.0 <= reported < 3.0, line
+        assert "(wait 2.0s)" in line, line
+        assert "holder pid 4242 still running" in line, line
+
+    def case_spawn_gives_up_and_says_the_holder_exited(
+            self, tmp_path, monkeypatch, capsys):
+        """Asserts: a spawn whose holder has already exited when the wait
+        ends logs the give-up WARNING naming the holder as exited, so a
+        failed start reads differently from a slow one."""
+        from cswap_pin import proxy as pin_proxy
+
+        monkeypatch.setattr(pin_proxy, "_SPAWN_WAIT_S", 0.1)
+        self._stub_spawn(monkeypatch, pin_proxy, lambda *a, **k: None,
+                         holder_exit=1)
+        certdir = tmp_path / "certs"
+        certdir.mkdir()
+        capsys.readouterr()
+        assert pin_proxy._spawn_daemon("1", "a@b.c", certdir) is None
+        err = capsys.readouterr().err
+        assert "WARNING successor" in err and "holder pid 4242 exited" in err, (
+            err)
 
     def case_spawn_daemon_raising_falls_back_to_promotion(
             self, tmp_path, monkeypatch):
@@ -29765,8 +29875,11 @@ class TestAHandoverIsNotAFailure:
 
         def fake_read(cd, fingerprint=None):
             seen["reads"] += 1
-            # the handover settles on the third look
-            return 41000 if seen["reads"] >= 3 else None
+            # The handover settles on the fourth look: the fast path and the
+            # re-check under the lock are the first two, and the wait probes
+            # once before its first sleep, so a third-look settle would be
+            # found without the wait ever sleeping.
+            return 41000 if seen["reads"] >= 4 else None
 
         # A POSITIVE CONTROL for the sibling test's `census.sleeps == []`:
         # this case DOES reach the `time.sleep(0.1)` in ensure_proxy's
