@@ -5960,6 +5960,11 @@ def _restore_record_from_wiring(
         org = str(ident.get("organizationUuid") or "")
         save_pin(backup_root, email, org)
         return email, org
+    except locking.StaleBuildWriteError as exc:
+        # A stale build's refused `save_pin` stops recording, said once,
+        # rather than vanishing into the None below.
+        _stop_store_writes_on_stale_build(exc)
+        return None
     except Exception:  # noqa: BLE001 — heal must never fail on this repair
         return None
 
@@ -6166,6 +6171,9 @@ def repin_current(switcher) -> bool:
             switcher, email, org,
             identity=host.identity_for_config(
                 switcher, email=email, num=host._slot_for(switcher, email, org))))
+    except locking.StaleBuildWriteError as exc:
+        _stop_store_writes_on_stale_build(exc)
+        return False
     except Exception:  # noqa: BLE001 -- a repair must not take its caller down
         return False
 
@@ -6240,8 +6248,8 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
             unspliced or _back is None or bool(result)
             or _config_already_names(_back)
         )
-    except Exception:  # noqa: BLE001 -- the re-read below is the verdict
-        pass
+    except Exception as exc:  # noqa: BLE001 -- the re-read below is the verdict
+        _stop_store_writes_on_stale_build(exc)
     return unspliced and host._pinned_email_now(switcher) == before
 
 
@@ -6351,6 +6359,7 @@ def set_pin(
             switcher, email, org_uuid,
             identity=host.identity_for_config(switcher, email=email, num=num))
     except Exception as exc:  # noqa: BLE001 -- a traceback tells a user nothing
+        _stop_store_writes_on_stale_build(exc)
         rolled = _restore_pin(switcher, before)
         return False, (
             f"Could not pin the cloud account: {host._safe(exc)}. "
@@ -14004,6 +14013,11 @@ def _active_oauth_token() -> "str | None":
         sw = require("switcher").ClaudeAccountSwitcher()
         raw = json.loads(sw._read_credentials() or "{}")
         return (raw.get("claudeAiOauth") or {}).get("accessToken") or None
+    except locking.StaleBuildWriteError as exc:
+        # The constructor runs claude-swap's pending data migrations, which
+        # a stale build is refused.
+        _stop_store_writes_on_stale_build(exc)
+        return None
     except Exception:  # noqa: BLE001 — never take the daemon down
         return None
 
@@ -14021,6 +14035,9 @@ def _active_pin_account_label() -> "str | None":
         sw = require("switcher").ClaudeAccountSwitcher()
         num = sw.current_account_number()
         return str(num) if num is not None else None
+    except locking.StaleBuildWriteError as exc:
+        _stop_store_writes_on_stale_build(exc)
+        return None
     except Exception:  # noqa: BLE001 — never take the daemon down
         return None
 
@@ -14082,6 +14099,8 @@ def _verifying_context() -> "ssl.SSLContext":
             / "pin-proxy" / "ca-bundle.pem"
         if bundle.exists():
             ctx.load_verify_locations(cafile=str(bundle))
+    except locking.StaleBuildWriteError as exc:
+        _stop_store_writes_on_stale_build(exc)
     except Exception:  # noqa: BLE001 — an unpinned machine has no bundle
         pass
     return ctx
@@ -21052,6 +21071,11 @@ def _live_account_slot() -> str | None:
     try:
         return require("switcher").ClaudeAccountSwitcher(
         ).current_account_number()
+    except locking.StaleBuildWriteError as exc:
+        # The constructor runs claude-swap's pending data migrations, which
+        # a stale build is refused.
+        _stop_store_writes_on_stale_build(exc)
+        return None
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None
 
@@ -21104,6 +21128,9 @@ def _live_account_headroom(num: str) -> float | None:
                 label for label, _, _ in oauth.relevant_windows(usage, ("all",))}:
             return None
         return oauth.account_headroom(usage, ("all",))
+    except locking.StaleBuildWriteError as exc:
+        _stop_store_writes_on_stale_build(exc)
+        return None
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None
 
@@ -21211,6 +21238,11 @@ def _fleet_earliest_provable_reset() -> tuple[float | None, bool]:
             if earliest is None or reset < earliest:
                 earliest = reset
         return earliest, all_provable
+    except locking.StaleBuildWriteError as exc:
+        # `fetch=set()` forbids the network, not the store: the collect pass
+        # can still rewrite a rotated backup and sweep the stash, both writes.
+        _stop_store_writes_on_stale_build(exc)
+        return None, True
     except Exception:  # noqa: BLE001 — never let this break the relay
         return None, True
 

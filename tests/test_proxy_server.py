@@ -20122,3 +20122,234 @@ class TestStaleBuildStopsRecording:
         assert len(logged) == 1, logged
         assert logged[0].startswith("WARNING usage and credential-refusal")
         assert "the installed build cannot be read" in logged[0]
+
+
+class TestStaleBuildStopsRecordingAtStoreWriteCatches:
+    """X3709 unit 2: each proxy catch that wraps a claude-swap store write
+    (the record restore from the wiring, the re-apply, the record roll back,
+    `set_pin`, the live slot and headroom reads and the fleet reset read,
+    whose collect pass also writes) hands a stale-build refusal to
+    `_stop_store_writes_on_stale_build`, so recording stops with the one
+    lifecycle WARNING instead of the refusal being swallowed."""
+
+    _stale_error = staticmethod(TestStaleBuildStopsRecording._stale_error)
+
+    def _wire(self, monkeypatch, *, switcher=None, pin_host=None, paths=None):
+        """Route `require` to the given fakes (real modules otherwise), reset
+        the stop flag and capture the lifecycle log."""
+        import importlib
+        import types as _types
+
+        from cswap_pin import proxy as pp
+
+        fakes = {}
+        if switcher is not None:
+            fakes["switcher"] = _types.SimpleNamespace(ClaudeAccountSwitcher=switcher)
+        if pin_host is not None:
+            fakes["pin"] = pin_host
+        if paths is not None:
+            fakes["paths"] = paths
+        monkeypatch.setattr(
+            pp, "require",
+            lambda name: fakes[name] if name in fakes
+            else importlib.import_module(f"claude_swap.{name}"))
+        monkeypatch.setattr(pp, "_store_writes_refused", False)
+        logged = []
+        monkeypatch.setattr(pp, "_log_lifecycle", logged.append)
+        return pp, logged
+
+    @staticmethod
+    def _assert_stopped_once(pp, logged):
+        assert pp._store_writes_stopped() is True
+        assert len(logged) == 1, logged
+        assert logged[0].startswith(
+            "WARNING usage and credential-refusal recording stopped")
+        assert "this process loaded build 0.26.0" in logged[0]
+
+    @staticmethod
+    def _pin_host(**overrides):
+        import types as _types
+
+        host = _types.SimpleNamespace(
+            identity_for_config=lambda sw, email=None, num=None: {
+                "emailAddress": email},
+            _slot_for=lambda sw, email, org: "1",
+            _pinned_email_now=lambda sw: None,
+            _live_login_for_config=lambda sw: None,
+            _safe=str,
+        )
+        for name, value in overrides.items():
+            setattr(host, name, value)
+        return host
+
+    def test_record_restore_from_wiring(self, monkeypatch, tmp_path):
+        """Asserts: a refused `save_pin` while restoring the record from a
+        wiring this package owns returns None, stops recording and logs the
+        WARNING once."""
+        import types as _types
+
+        stale = self._stale_error()
+        paths = _types.SimpleNamespace(
+            get_global_config_path=lambda: tmp_path / ".claude.json")
+        pp, logged = self._wire(monkeypatch, paths=paths)
+        monkeypatch.setattr(pp, "remembered_pin_identity",
+                            lambda certdir: {"emailAddress": "a@example.com",
+                                             "organizationUuid": "org-1"})
+        monkeypatch.setattr(pp, "_read_json",
+                            lambda path: {"env": {"HTTPS_PROXY": "http://x"}})
+        monkeypatch.setattr(pp, "_read_ledger",
+                            lambda cfg, raw: {pp._WIRE_MARK: ["HTTPS_PROXY"]})
+
+        def _refused(*a, **k):
+            raise stale
+
+        monkeypatch.setattr(pp, "save_pin", _refused)
+        assert pp._restore_record_from_wiring(tmp_path, tmp_path) is None
+        self._assert_stopped_once(pp, logged)
+
+    def test_reapply_current(self, monkeypatch):
+        """Asserts: a refused `apply_pin` inside `repin_current` returns
+        False, stops recording and logs the WARNING once."""
+        import types as _types
+
+        stale = self._stale_error()
+        pp, logged = self._wire(monkeypatch, pin_host=self._pin_host())
+        monkeypatch.setattr(pp, "load_pin", lambda root: ("a@example.com", "org-1"))
+
+        def _refused(*a, **k):
+            raise stale
+
+        monkeypatch.setattr(pp, "apply_pin", _refused)
+        sw = _types.SimpleNamespace(backup_dir="/nonexistent")
+        assert pp.repin_current(sw) is False
+        self._assert_stopped_once(pp, logged)
+
+    def test_record_roll_back(self, monkeypatch):
+        """Asserts: a refused `apply_pin` while putting the previous record
+        back stops recording and logs the WARNING once, and the verdict is
+        still the re-read of the record."""
+        stale = self._stale_error()
+        before = ("a@example.com", "org-1")
+        pp, logged = self._wire(monkeypatch, pin_host=self._pin_host(
+            _pinned_email_now=lambda sw: before))
+
+        def _refused(*a, **k):
+            raise stale
+
+        monkeypatch.setattr(pp, "apply_pin", _refused)
+        assert pp._restore_pin(object(), before) is True
+        self._assert_stopped_once(pp, logged)
+
+    def test_set_pin(self, monkeypatch):
+        """Asserts: a refused `apply_pin` in `set_pin` reports the failure,
+        stops recording and logs the WARNING once, though the roll back's
+        own `apply_pin` is refused a second time."""
+        import types as _types
+
+        stale = self._stale_error()
+        pp, logged = self._wire(monkeypatch, pin_host=self._pin_host())
+        calls = []
+
+        def _refused(*a, **k):
+            calls.append(a)
+            raise stale
+
+        monkeypatch.setattr(pp, "apply_pin", _refused)
+        sw = _types.SimpleNamespace(_account_kind=lambda num: "oauth")
+        ok, msg = pp.set_pin(sw, "a@example.com", "org-1", num="1")
+        assert ok is False
+        assert msg.startswith("Could not ") and "cloud account" in msg
+        assert len(calls) == 2, calls
+        self._assert_stopped_once(pp, logged)
+
+    def test_live_account_slot(self, monkeypatch):
+        """Asserts: a switcher whose construction (its pending data
+        migrations) is refused returns no live slot, stops recording and
+        logs the WARNING once."""
+        stale = self._stale_error()
+
+        class _Switcher:
+            def __init__(self):
+                raise stale
+
+        pp, logged = self._wire(monkeypatch, switcher=_Switcher)
+        assert pp._live_account_slot() is None
+        self._assert_stopped_once(pp, logged)
+
+    def test_live_account_headroom(self, monkeypatch):
+        """Asserts: a refused write during the live slot's usage read returns
+        an unknown headroom, stops recording and logs the WARNING once."""
+        stale = self._stale_error()
+
+        class _Switcher:
+            def usage_entries_by_account(self, fetch=None):
+                raise stale
+
+        pp, logged = self._wire(monkeypatch, switcher=_Switcher)
+        assert pp._live_account_headroom("1") is None
+        self._assert_stopped_once(pp, logged)
+
+    def test_live_account_headroom_other_error_keeps_recording(self, monkeypatch):
+        """Asserts: an error that is not the stale-build refusal returns an
+        unknown headroom as before and leaves recording on, with no line."""
+
+        class _Switcher:
+            def usage_entries_by_account(self, fetch=None):
+                raise OSError("usage store unreadable")
+
+        pp, logged = self._wire(monkeypatch, switcher=_Switcher)
+        assert pp._live_account_headroom("1") is None
+        assert pp._store_writes_stopped() is False
+        assert logged == []
+
+    def test_fleet_earliest_provable_reset(self, monkeypatch):
+        """Asserts: a refused write during the store-only fleet read (its
+        collect pass still writes) returns nothing proven, stops recording
+        and logs the WARNING once."""
+        stale = self._stale_error()
+
+        class _Switcher:
+            def usage_entries_by_account(self, fetch=None):
+                assert fetch == set()
+                raise stale
+
+        pp, logged = self._wire(monkeypatch, switcher=_Switcher)
+        assert pp._fleet_earliest_provable_reset() == (None, True)
+        self._assert_stopped_once(pp, logged)
+
+    @staticmethod
+    def _refused_construction(stale):
+        class _Switcher:
+            def __init__(self):
+                raise stale
+
+        return _Switcher
+
+    def test_active_oauth_token(self, monkeypatch):
+        """Asserts: a switcher whose construction is refused gives no active
+        token, stops recording and logs the WARNING once."""
+        pp, logged = self._wire(
+            monkeypatch, switcher=self._refused_construction(self._stale_error()))
+        assert pp._active_oauth_token() is None
+        self._assert_stopped_once(pp, logged)
+
+    def test_active_account_label(self, monkeypatch):
+        """Asserts: a switcher whose construction is refused gives no active
+        account label, stops recording and logs the WARNING once."""
+        pp, logged = self._wire(
+            monkeypatch, switcher=self._refused_construction(self._stale_error()))
+        assert pp._active_pin_account_label() is None
+        self._assert_stopped_once(pp, logged)
+
+    def test_verifying_context(self, monkeypatch):
+        """Asserts: a switcher whose construction is refused while locating
+        the CA bundle still yields the default context, stops recording and
+        logs the WARNING once."""
+        import ssl
+
+        pp, logged = self._wire(
+            monkeypatch, switcher=self._refused_construction(self._stale_error()))
+        monkeypatch.setattr(pp.oauth, "_pin_aware_ssl_context", None,
+                            raising=False)
+        assert isinstance(pp._verifying_context(), ssl.SSLContext)
+        self._assert_stopped_once(pp, logged)
