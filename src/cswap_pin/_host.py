@@ -23,6 +23,8 @@ This module IS that shape. Eight symbols, eight modules, listed once:
     pin                               cswap's identity readers over its own
                                       backup store, for set/show/re-pin
     printer                           accent, dimmed, warning: the CLI's styling
+    start_hold                        the Remote Control start hold, released
+                                      on the server's registration (X3768)
 
 Two rules follow from putting it here:
 

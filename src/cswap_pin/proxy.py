@@ -16349,6 +16349,49 @@ class PinProxy:
         except Exception:  # noqa: BLE001 — a statistic must not cost a request
             pass
 
+    def _note_remote_control_registered(self, method: str, path: str,
+                                        status_line: bytes) -> None:
+        """Release claude-swap's Remote Control start hold (board row X3768).
+
+        `--ensure --remote-control-start` makes the owner account active and
+        writes a hold that stops the account rotation, because `claude
+        remote-control` refuses to start on an inference-only login. The
+        server's environment registration, `POST /v1/environments/bridge`
+        answered 2xx, is the proof it started on that login; from then on
+        this proxy answers its traffic as the owner whatever the rotation
+        does, so the hold is deleted here.
+
+        ONLY THAT REGISTRATION. Worker and bridge registrations also come
+        from sessions a hand-launched `claude` opens, and releasing on one of
+        those would free the rotation before the server has read the login.
+        `?beta=true` is the managed-agents SDK on the same path
+        (`_ENV_SDK_BETA`), not this login.
+
+        The hold lives in claude-swap's backup directory, the parent of the
+        cert directory this daemon was started with (`switcher.backup_dir /
+        "pin-proxy"` at both spawn sites).
+
+        Never raises: a release must not cost a request. A failure is one
+        daemon log line, and the hold then expires after claude-swap's
+        `START_HOLD_MAX_S` with its own ERROR event.
+        """
+        try:
+            if method != "POST" or not status_line.startswith(b"HTTP/1.1 2"):
+                return
+            if (path.split("?", 1)[0] != "/v1/environments/bridge"
+                    or _ENV_SDK_BETA.search(path)):
+                return
+            start_hold = require("start_hold")
+            backup_dir = self._certdir.parent
+            hold = start_hold.read_start_hold(backup_dir)
+            if hold is None or time.time() < hold.set_at:
+                return
+            if start_hold.remove_start_hold(backup_dir):
+                _log_lifecycle("start hold released: Remote Control registered")
+        except Exception as exc:  # noqa: BLE001 -- a release must not cost a request
+            _log_lifecycle(
+                f"start hold release failed: {type(exc).__name__}: {exc}")
+
     def _note_bridge_superseded(self, method: str, path: str,
                                  status_line: bytes) -> None:
         """A worker POST refused with 409 is not a bridge gone quiet.
@@ -18929,7 +18972,15 @@ class PinProxy:
                         up, conn, getattr(self._local, "cid", 0),
                         reject_on_auth_error=retry,
                         method=method,
-                        on_status=lambda st: _release_bridge_hold(),
+                        # The Remote Control server's environment
+                        # registration arrives on THIS path (absolute form),
+                        # so the start hold is released from here too.
+                        on_status=lambda st: (
+                            _release_bridge_hold(),
+                            self._note_remote_control_registered(
+                                method, rel, st)
+                            if host == UPSTREAM_HOST and secure else None,
+                        ),
                         note_hop=host == UPSTREAM_HOST and secure,
                     )
                     if isinstance(result, _AuthRejected):
@@ -19785,6 +19836,7 @@ class PinProxy:
                     self._note_attachment(path, st),
                     self._note_rename(method, path, st),
                     self._note_bridge_superseded(method, path, st),
+                    self._note_remote_control_registered(method, path, st),
                     self._tunnel_trace(
                         f"    <- {st.decode('latin1', 'replace').strip()}"
                         f"  {method} {path}  ua={_ua}"),
